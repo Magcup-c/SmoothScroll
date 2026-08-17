@@ -4,6 +4,9 @@ project(SmoothScrollLib CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ソースをUTF-8として明示的に解釈させる（日本語コメント対策）
+add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+
 # スムーススクロールDLL本体
 add_library(SmoothScroll SHARED
     SmoothScroll/SmoothScroll.cpp

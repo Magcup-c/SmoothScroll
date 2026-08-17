@@ -46,4 +46,28 @@ SS_API BOOL ss_is_scrolling(HANDLE h);
 // 動作中の慣性を即時停止（新しいタッチやクリック時に呼ぶと自然）
 SS_API void ss_cancel_momentum(HANDLE h);
 
+// ============================================================
+// オーバースクロール(ラバーバンド)ユーティリティ
+// これらは状態を持たない純粋関数。位置・速度はホスト側で保持すること。
+// ============================================================
+
+// 範囲外への移動量を圧縮する（Apple風のラバーバンド抵抗）。
+// raw_delta : このフレームで加えたい移動量（DLLのコールバックから来た dy 等）
+// pos       : 適用前の現在位置
+// min_pos, max_pos : コンテンツの許容範囲
+// coeff     : 抵抗係数。小さいほど強く抵抗する。既定推奨値 0.55
+// 戻り値    : 実際に pos へ加算すべき移動量
+SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, float max_pos, float coeff);
+
+// pos を target（境界内の最近接位置など）へバネで近づける1ステップ。
+// velocity はホスト側が保持し、毎フレームこの関数経由で更新すること。
+// stiffness: バネの強さ（既定 200 目安）, damping: 減衰（既定 20 目安、臨界減衰に近い値）
+// 戻り値: 更新後の pos
+SS_API float ss_spring_step(float pos, float target, float* velocity, float dt_sec,
+                             float stiffness, float damping);
+
+// バネアニメーションが収束したかどうかの判定ヘルパー
+SS_API BOOL ss_spring_settled(float pos, float target, float velocity,
+                               float pos_epsilon, float vel_epsilon);
+
 } // extern "C"

@@ -2,10 +2,13 @@
 #define SMOOTHSCROLL_EXPORTS
 #include <Windows.h>
 #include <windowsx.h>
+#include <CommCtrl.h>
+#include <mmsystem.h>
 #include <atomic>
 #include <mutex>
 #include "SmoothScroll.h"
 #include "PhysicsEngine.h"
+#include <cmath>
 
 #pragma comment(lib, "winmm.lib")
 
@@ -211,6 +214,60 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, v
         return nullptr;
     }
     return (HANDLE)inst;
+}
+
+// ============================================================
+// オーバースクロール ユーティリティ実装
+// ============================================================
+
+SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, float max_pos, float coeff) {
+    if (coeff <= 0.0f) coeff = 0.55f;
+
+    // 現在すでに境界外にいる場合（オーバースクロール中にさらに動かす/戻す）
+    float overshoot = 0.0f;
+    if (pos < min_pos) overshoot = min_pos - pos;
+    else if (pos > max_pos) overshoot = pos - max_pos;
+
+    if (overshoot > 0.0f) {
+        // 食い込み量が大きいほど生デルタを強く減衰させる
+        float resistance = coeff / (coeff + overshoot);
+        return raw_delta * resistance;
+    }
+
+    // 範囲内: このフレームで境界を超える分だけ圧縮する
+    float new_pos = pos + raw_delta;
+    if (new_pos < min_pos) {
+        float within = min_pos - pos;        // 境界までの距離（>=0）
+        float beyond = min_pos - new_pos;    // 境界を超えた生の量
+        float resisted = coeff * beyond / (coeff + beyond);
+        return -within - resisted;
+    }
+    if (new_pos > max_pos) {
+        float within = max_pos - pos;
+        float beyond = new_pos - max_pos;
+        float resisted = coeff * beyond / (coeff + beyond);
+        return within + resisted;
+    }
+    return raw_delta; // 範囲内で完結、抵抗なし
+}
+
+SS_API float ss_spring_step(float pos, float target, float* velocity, float dt_sec,
+                             float stiffness, float damping) {
+    if (!velocity) return pos;
+    if (stiffness <= 0.0f) stiffness = 200.0f;
+    if (damping <= 0.0f) damping = 20.0f;
+
+    // 減衰調和振動子: a = -k*x - c*v
+    float displacement = pos - target;
+    float accel = -stiffness * displacement - damping * (*velocity);
+    *velocity += accel * dt_sec;
+    pos += (*velocity) * dt_sec;
+    return pos;
+}
+
+SS_API BOOL ss_spring_settled(float pos, float target, float velocity,
+                               float pos_epsilon, float vel_epsilon) {
+    return (std::fabs(pos - target) < pos_epsilon && std::fabs(velocity) < vel_epsilon) ? TRUE : FALSE;
 }
 
 SS_API void ss_detach(HANDLE h) {

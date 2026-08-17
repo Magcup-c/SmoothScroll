@@ -1,4 +1,0 @@
-C:/Users/Masak/Downloads/Kimi_Agent_Mac風タッチDLL/SmoothScrollLib/build/CMakeFiles/SmoothScroll.dir
-C:/Users/Masak/Downloads/Kimi_Agent_Mac風タッチDLL/SmoothScrollLib/build/CMakeFiles/SSDemo.dir
-C:/Users/Masak/Downloads/Kimi_Agent_Mac風タッチDLL/SmoothScrollLib/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/Masak/Downloads/Kimi_Agent_Mac風タッチDLL/SmoothScrollLib/build/CMakeFiles/ZERO_CHECK.dir

@@ -206,8 +206,21 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, v
         return nullptr;
     }
 
+    // Precision Touchpad からの WM_POINTERWHEEL/HWHEEL を受け取るには、
+    // このウィンドウを PT_TOUCHPAD のポインタ入力ターゲットとして
+    // 明示的に登録する必要がある。未登録のままだと Windows は従来の
+    // WM_MOUSEWHEEL にフォールバックしてしまい、本DLLには
+    // 一切イベントが届かない（＝タイトルバーの count が全く増えない現象）。
+    if (!RegisterPointerInputTarget(hwnd, PT_TOUCHPAD)) {
+        RemoveWindowSubclass(hwnd, SubclassProc, SUBCLASS_ID);
+        CloseHandle(inst->wake_event);
+        delete inst;
+        return nullptr;
+    }
+
     inst->thread = CreateThread(nullptr, 0, PhysicsThread, inst, 0, nullptr);
     if (!inst->thread) {
+        UnregisterPointerInputTarget(hwnd, PT_TOUCHPAD);
         RemoveWindowSubclass(hwnd, SubclassProc, SUBCLASS_ID);
         CloseHandle(inst->wake_event);
         delete inst;
@@ -279,6 +292,7 @@ SS_API void ss_detach(HANDLE h) {
         WaitForSingleObject(inst->thread, 2000);
         CloseHandle(inst->thread);
     }
+    UnregisterPointerInputTarget(inst->hwnd, PT_TOUCHPAD);
     RemoveWindowSubclass(inst->hwnd, SubclassProc, SUBCLASS_ID);
     CloseHandle(inst->wake_event);
     delete inst;

@@ -8,6 +8,7 @@ namespace {
     float g_scrollY = 0;       // 現在のスクロール位置 [px]（範囲外にも一時的にはみ出せる）
     float g_maxScroll = 2000;  // コンテンツ長に応じた上限
     HANDLE g_ss = nullptr;
+    ULONG g_wheelCount = 0;
 
     // オーバースクロール(ラバーバンド)関連の状態はホスト側で保持する
     float g_springVel = 0.0f;
@@ -40,18 +41,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_APP + 1: {
-        static int s_count = 0;
-        float dx = *(float*)&wParam;
-        float dy = *(float*)&lParam;
+    float dx = *(float*)&wParam;
+    float dy = *(float*)&lParam;
+    g_wheelCount++;
+    wchar_t buf[64];
+    swprintf_s(buf, L"SmoothScroll Demo  count=%lu  dy=%.1f", g_wheelCount, dy);
+    SetWindowTextW(hwnd, buf);
 
-        float applied = ss_rubberband_delta(dy, g_scrollY, 0.0f, g_maxScroll, RUBBERBAND_COEFF);
-        g_scrollY += applied;
-        g_springVel = 0.0f;
-
-        // ★デバッグ: タイトルバーで受信状況を可視化
-        wchar_t buf[128];
-        swprintf_s(buf, L"count=%d dy=%.2f applied=%.2f scrollY=%.2f", ++s_count, dy, applied, g_scrollY);
-        SetWindowTextW(hwnd, buf);
 
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
@@ -106,7 +102,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
-    EnableMouseInPointer(FALSE);
+    EnableMouseInPointer(TRUE);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;

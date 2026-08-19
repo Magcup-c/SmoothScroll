@@ -71,4 +71,12 @@ void PhysicsEngine::cancel() {
     momentum_ = false;
 }
 
+void PhysicsEngine::stopMomentumOnly() {
+    vx_ = vy_ = 0;
+    rem_x_ = rem_y_ = 0;
+    momentum_ = false;
+    // touching_ はそのまま維持する（呼び出し元がまだ操作中の可能性があるため）
+}
+
 bool PhysicsEngine::isActive() const { return touching_ || momentum_; }
+bool PhysicsEngine::isTouching() const { return touching_; }

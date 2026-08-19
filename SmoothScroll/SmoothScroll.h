@@ -15,7 +15,8 @@ extern "C" {
 // スムーズ化されたスクロールデルタを受け取るコールバック。
 // dx, dy: ピクセル単位の移動量（このフレームでスクロールすべき量）
 // user: ss_attach で渡した任意ポインタ
-// 呼び出しスレッド: DLL内部の物理ループスレッド（UI更新はPostMessage等でUIスレッドへ回すこと）
+// 呼び出しスレッド: DLL内部の物理ループスレッド（UI更新はPostMessage等でUIスレッドへ
+// 回してください）
 typedef void (CALLBACK *SS_ScrollCallback)(float dx, float dy, void* user);
 
 typedef struct SS_Config {
@@ -40,11 +41,19 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, v
 // 取り外し。物理スレッド停止とサブクラス解除を行う。
 SS_API void ss_detach(HANDLE h);
 
-// スクロール中かどうか（慣性でまだ動いている最中ならTRUE）
+// スクロール中かどうか（タッチ中 or 慣性でまだ動いている最中ならTRUE）
 SS_API BOOL ss_is_scrolling(HANDLE h);
 
-// 動作中の慣性を即時停止（新しいタッチやクリック時に呼ぶと自然）
+// 動作中の慣性を完全キャンセル（新しいタッチやクリック時に呼ぶと自然）。
+// タッチ中フラグも含めて全状態をリセットするため、
+// 「本当に新規セッションが始まった」場面（例: WM_POINTERDOWN相当）でのみ使うこと。
 SS_API void ss_cancel_momentum(HANDLE h);
+
+// 慣性(モメンタム)のみを停止する。タッチ中フラグ(touching)には影響しない。
+// ユーザーがまだ指を動かしている最中に「境界へ到達したので慣性の飛び出しを
+// 止めたい」というホスト側の意図（オーバースクロール制御など）に使う。
+// ss_cancel_momentum との違い: こちらはタッチ操作の継続性を壊さない。
+SS_API void ss_stop_inertia(HANDLE h);
 
 // ============================================================
 // オーバースクロール(ラバーバンド)ユーティリティ

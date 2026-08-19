@@ -17,6 +17,17 @@ namespace {
 constexpr UINT_PTR SUBCLASS_ID = 0x53534D4B; // 'SSMK'
 constexpr UINT     WM_SS_WAKE  = WM_APP + 0x53; // 物理ループ起床用
 
+// Precision Touchpad は HID Digitizer コレクション
+// (Usage Page 0x0D = Digitizers, Usage 0x05 = Touch Pad) として
+// Raw Input を送り続ける。この専用チャンネルでの活動有無を
+// 「タッチパッドかどうか」の判定材料に使う。
+// (WM_POINTERWHEEL の POINTER_INFO.sourceDevice は
+//  EnableMouseInPointer(TRUE) 環境下では合成イベントとなり
+//  無効ハンドル(-1)になるため、そちら経由での判定は不可能)
+constexpr USHORT HID_USAGE_PAGE_DIGITIZER = 0x0D;
+constexpr USHORT HID_USAGE_TOUCH_PAD      = 0x05;
+constexpr ULONGLONG TOUCHPAD_ACTIVITY_WINDOW_MS = 250; // この時間内のRaw Input活動があればタッチパッド由来とみなす
+
 struct Instance {
     HWND hwnd = nullptr;
     SS_Config cfg{};
@@ -33,6 +44,9 @@ struct Instance {
     ULONGLONG last_tick = 0;       // 前回イベント時刻
     float pending_dx = 0, pending_dy = 0; // 未送出のタッチ中デルタ
 
+    std::atomic<ULONGLONG> last_touchpad_raw_tick{0}; // 直近のタッチパッドRaw Input時刻
+    bool raw_input_registered = false;
+
     explicit Instance(const SS_Config& c) : engine(c), cfg(c) {}
 };
 
@@ -46,7 +60,6 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 
-    // リフレッシュレート推定（既定 60Hz。取得できれば実値を使う）
     int hz = 60;
     DEVMODEW dm{}; dm.dmSize = sizeof(dm);
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
@@ -58,12 +71,10 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
 
     while (!inst->quit.load()) {
         if (!animating) {
-            // 慣性中でなければデルタ到着まで寝る
             WaitForSingleObject(inst->wake_event, INFINITE);
             if (inst->quit.load()) break;
         }
 
-        // タイマーを次フレームにセット
         LARGE_INTEGER due{};
         due.QuadPart = -(LONGLONG)(frame_dt * 10000000.0f);
         SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
@@ -71,7 +82,6 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
         DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
         if (inst->quit.load()) break;
 
-        // タッチ中の滞留デルタを先に吐き出す（追従フェーズ）
         float tdx = 0, tdy = 0;
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
@@ -81,7 +91,6 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
         if (tdx != 0 || tdy != 0)
             inst->cb(tdx, tdy, inst->user);
 
-        // 慣性ステップ
         float mdx = 0, mdy = 0;
         bool active;
         {
@@ -99,12 +108,11 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
     return 0;
 }
 
-// ---- サブクラスプロシージャ ----------------------------------------------
-bool IsTouchpadPointer(WPARAM wParam) {
-    UINT32 id = GET_POINTERID_WPARAM(wParam);
-    POINTER_INFO pi{};
-    if (!GetPointerInfo(id, &pi)) return false;
-    return pi.pointerType == PT_TOUCHPAD;
+// ---- タッチパッド判定 ------------------------------------------------
+bool IsTouchpadActive(Instance* inst) {
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG last = inst->last_touchpad_raw_tick.load();
+    return (last != 0) && ((now - last) <= TOUCHPAD_ACTIVITY_WINDOW_MS);
 }
 
 LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
@@ -112,9 +120,14 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     Instance* inst = reinterpret_cast<Instance*>(refData);
 
     switch (msg) {
+    case WM_INPUT: {
+        inst->last_touchpad_raw_tick.store(GetTickCount64());
+        break;
+    }
+
     case WM_POINTERWHEEL:
     case WM_POINTERHWHEEL: {
-        if (!IsTouchpadPointer(wParam)) break; // マウス等は既定処理へ
+        if (!IsTouchpadActive(inst)) break;
 
         if (msg == WM_POINTERHWHEEL && !inst->cfg.enable_horizontal) break;
 
@@ -127,29 +140,25 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
             std::lock_guard<std::mutex> lk(inst->mtx);
             dt = inst->last_tick ? (float)(now - inst->last_tick) / 1000.0f : 1.0f / 60.0f;
             inst->last_tick = now;
-            if (dt > 0.25f) dt = 1.0f / 60.0f; // 長い空白後は初速を暴発させない
+            if (dt > 0.25f) dt = 1.0f / 60.0f;
 
             if (msg == WM_POINTERWHEEL)
                 inst->engine.feedDelta(0, px, dt);
             else
                 inst->engine.feedDelta(px, 0, dt);
 
-            // タッチ中の生デルタは滞留バッファへ（物理スレッドがフレーム単位で送出）
             if (msg == WM_POINTERWHEEL) inst->pending_dy += px;
             else                        inst->pending_dx += px;
         }
         SetEvent(inst->wake_event);
-        // ジェスチャ終了検知タイマーをリセット（デルタ到着のたびに再武装）
         SetTimer(hwnd, SUBCLASS_ID, 30, nullptr);
-        return 0; // 生メッセージは飲み込む（二重スクロール防止）
+        return 0;
     }
 
-    // タッチパッドの2本指パンは「ジェスチャ終了」を明示するメッセージが無い。
-    // 一定時間デルタが来なければ離れたとみなすタイマーで release を判定する。
     case WM_TIMER:
         if (wParam == SUBCLASS_ID) {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            if (GetTickCount64() - inst->last_tick > 90) { // 90ms無入力でリリース
+            if (GetTickCount64() - inst->last_tick > 90) {
                 inst->engine.release();
                 KillTimer(hwnd, SUBCLASS_ID);
                 SetEvent(inst->wake_event);
@@ -159,9 +168,9 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         break;
 
     case WM_POINTERDOWN:
-        if (IsTouchpadPointer(wParam)) {
+        if (IsTouchpadActive(inst)) {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            inst->engine.cancel(); // 新しいタッチで慣性をキャンセル
+            inst->engine.cancel(); // 新しいタッチで慣性をキャンセル（本当の新規セッション）
         }
         break;
 
@@ -206,21 +215,23 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, v
         return nullptr;
     }
 
-    // Precision Touchpad からの WM_POINTERWHEEL/HWHEEL を受け取るには、
-    // このウィンドウを PT_TOUCHPAD のポインタ入力ターゲットとして
-    // 明示的に登録する必要がある。未登録のままだと Windows は従来の
-    // WM_MOUSEWHEEL にフォールバックしてしまい、本DLLには
-    // 一切イベントが届かない（＝タイトルバーの count が全く増えない現象）。
-    if (!RegisterPointerInputTarget(hwnd, PT_TOUCHPAD)) {
-        RemoveWindowSubclass(hwnd, SubclassProc, SUBCLASS_ID);
-        CloseHandle(inst->wake_event);
-        delete inst;
-        return nullptr;
-    }
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = HID_USAGE_PAGE_DIGITIZER;
+    rid.usUsage = HID_USAGE_TOUCH_PAD;
+    rid.dwFlags = RIDEV_INPUTSINK;
+    rid.hwndTarget = hwnd;
+    inst->raw_input_registered = RegisterRawInputDevices(&rid, 1, sizeof(rid)) == TRUE;
 
     inst->thread = CreateThread(nullptr, 0, PhysicsThread, inst, 0, nullptr);
     if (!inst->thread) {
-        UnregisterPointerInputTarget(hwnd, PT_TOUCHPAD);
+        if (inst->raw_input_registered) {
+            RAWINPUTDEVICE rem{};
+            rem.usUsagePage = HID_USAGE_PAGE_DIGITIZER;
+            rem.usUsage = HID_USAGE_TOUCH_PAD;
+            rem.dwFlags = RIDEV_REMOVE;
+            rem.hwndTarget = nullptr;
+            RegisterRawInputDevices(&rem, 1, sizeof(rem));
+        }
         RemoveWindowSubclass(hwnd, SubclassProc, SUBCLASS_ID);
         CloseHandle(inst->wake_event);
         delete inst;
@@ -236,22 +247,19 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, v
 SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, float max_pos, float coeff) {
     if (coeff <= 0.0f) coeff = 0.55f;
 
-    // 現在すでに境界外にいる場合（オーバースクロール中にさらに動かす/戻す）
     float overshoot = 0.0f;
     if (pos < min_pos) overshoot = min_pos - pos;
     else if (pos > max_pos) overshoot = pos - max_pos;
 
     if (overshoot > 0.0f) {
-        // 食い込み量が大きいほど生デルタを強く減衰させる
         float resistance = coeff / (coeff + overshoot);
         return raw_delta * resistance;
     }
 
-    // 範囲内: このフレームで境界を超える分だけ圧縮する
     float new_pos = pos + raw_delta;
     if (new_pos < min_pos) {
-        float within = min_pos - pos;        // 境界までの距離（>=0）
-        float beyond = min_pos - new_pos;    // 境界を超えた生の量
+        float within = min_pos - pos;
+        float beyond = min_pos - new_pos;
         float resisted = coeff * beyond / (coeff + beyond);
         return -within - resisted;
     }
@@ -261,7 +269,7 @@ SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, floa
         float resisted = coeff * beyond / (coeff + beyond);
         return within + resisted;
     }
-    return raw_delta; // 範囲内で完結、抵抗なし
+    return raw_delta;
 }
 
 SS_API float ss_spring_step(float pos, float target, float* velocity, float dt_sec,
@@ -270,7 +278,6 @@ SS_API float ss_spring_step(float pos, float target, float* velocity, float dt_s
     if (stiffness <= 0.0f) stiffness = 200.0f;
     if (damping <= 0.0f) damping = 20.0f;
 
-    // 減衰調和振動子: a = -k*x - c*v
     float displacement = pos - target;
     float accel = -stiffness * displacement - damping * (*velocity);
     *velocity += accel * dt_sec;
@@ -292,7 +299,14 @@ SS_API void ss_detach(HANDLE h) {
         WaitForSingleObject(inst->thread, 2000);
         CloseHandle(inst->thread);
     }
-    UnregisterPointerInputTarget(inst->hwnd, PT_TOUCHPAD);
+    if (inst->raw_input_registered) {
+        RAWINPUTDEVICE rem{};
+        rem.usUsagePage = HID_USAGE_PAGE_DIGITIZER;
+        rem.usUsage = HID_USAGE_TOUCH_PAD;
+        rem.dwFlags = RIDEV_REMOVE;
+        rem.hwndTarget = nullptr;
+        RegisterRawInputDevices(&rem, 1, sizeof(rem));
+    }
     RemoveWindowSubclass(inst->hwnd, SubclassProc, SUBCLASS_ID);
     CloseHandle(inst->wake_event);
     delete inst;
@@ -310,4 +324,11 @@ SS_API void ss_cancel_momentum(HANDLE h) {
     if (!inst) return;
     std::lock_guard<std::mutex> lk(inst->mtx);
     inst->engine.cancel();
+}
+
+SS_API void ss_stop_inertia(HANDLE h) {
+    Instance* inst = static_cast<Instance*>(h);
+    if (!inst) return;
+    std::lock_guard<std::mutex> lk(inst->mtx);
+    inst->engine.stopMomentumOnly();
 }

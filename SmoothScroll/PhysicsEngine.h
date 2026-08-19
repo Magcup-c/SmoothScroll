@@ -21,8 +21,19 @@ public:
     // 戻り値: まだ動いているなら true（false ならループはスリープしてよい）
     bool step(float dt_sec, float& out_dx, float& out_dy);
 
+    // 完全キャンセル: タッチ中フラグも含めて全状態をリセットする。
+    // 新しいタッチ開始(WM_POINTERDOWN)など「本当に新規セッションが始まる」場面専用。
     void cancel();
+
+    // 慣性のみ停止: touching_ フラグには触れない。
+    // ユーザーがまだ指を動かしている最中に「境界に到達したので暴れる慣性を止めたい」
+    // という場面で使う。touching_ を誤って false にすると、まだドラッグ中なのに
+    // ホスト側のバネ処理が「操作終了した」と誤判定して起動し、
+    // ユーザーの入力とバネが同じ位置を奪い合って暴れる原因になる。
+    void stopMomentumOnly();
+
     bool isActive() const;
+    bool isTouching() const;
 
 private:
     SS_Config cfg_;

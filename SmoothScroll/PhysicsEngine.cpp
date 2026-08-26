@@ -1,5 +1,6 @@
 #include "PhysicsEngine.h"
 #include <cmath>
+#include <algorithm>
 
 PhysicsEngine::PhysicsEngine(const SS_Config& cfg) : cfg_(cfg) {}
 
@@ -12,6 +13,17 @@ void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec) {
     if (dt_sec > 0.0005f) {
         float ivx = dx / dt_sec;
         float ivy = dy / dt_sec;
+
+        // タイマ分解能の粗さ等により dt が異常に小さく計測された場合、
+        // 瞬間速度が跳ね上がりEMAを汚染して「離した瞬間に飛ぶ」原因になる。
+        // 外れ値をクランプしてから平滑化する。
+        const float spike_limit = cfg_.max_velocity * 3.0f;
+        float ispeed = std::sqrt(ivx * ivx + ivy * ivy);
+        if (ispeed > spike_limit && ispeed > 0.0f) {
+            float s = spike_limit / ispeed;
+            ivx *= s; ivy *= s;
+        }
+
         float a = cfg_.velocity_ema;
         vx_ = vx_ * (1.0f - a) + ivx * a;
         vy_ = vy_ * (1.0f - a) + ivy * a;

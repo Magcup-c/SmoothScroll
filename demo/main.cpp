@@ -8,6 +8,8 @@
 #include <windowsx.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
 #include "../SmoothScroll/SmoothScroll.h"
 
 namespace {
@@ -26,8 +28,6 @@ namespace {
     bool  g_overscrollX = false, g_overscrollY = false;
 
     // 「直前フレームで境界外だったか」のエッジ検出用フラグ。
-    // false→trueに変わった瞬間だけ ss_cancel_momentum を呼ぶことで、
-    // 壁到達後に何度も慣性打ち切り処理を重複実行してしまう(=カクつきの原因)のを防ぐ。
     bool g_wasOverX = false, g_wasOverY = false;
 
     HANDLE g_ss = nullptr;
@@ -69,11 +69,14 @@ namespace {
 }
 
 // DLLの物理スレッドから呼ばれる → UIスレッドへ転送
+// float→整数ハンドルの詰め替えはポインタ再解釈(strict-aliasing違反/UB)ではなく
+// memcpyでビットパターンをそのままコピーする(結果は同じだが未定義動作を避けられる)
 void CALLBACK OnScroll(float dx, float dy, void* user) {
     HWND hwnd = (HWND)user;
-    int packed_x = *(int*)&dx;
-    int packed_y = *(int*)&dy;
-    PostMessageW(hwnd, WM_APP + 1, (WPARAM)packed_x, (LPARAM)packed_y);
+    int32_t packed_x, packed_y;
+    std::memcpy(&packed_x, &dx, sizeof(float));
+    std::memcpy(&packed_y, &dy, sizeof(float));
+    PostMessageW(hwnd, WM_APP + 1, (WPARAM)(intptr_t)packed_x, (LPARAM)(intptr_t)packed_y);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -98,8 +101,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_APP + 1: {
-        float dx = *(float*)&wParam;
-        float dy = *(float*)&lParam;
+        int32_t packed_x = (int32_t)(intptr_t)wParam;
+        int32_t packed_y = (int32_t)(intptr_t)lParam;
+        float dx, dy;
+        std::memcpy(&dx, &packed_x, sizeof(float));
+        std::memcpy(&dy, &packed_y, sizeof(float));
 
         // 縦横それぞれ独立にラバーバンド抵抗を適用（これで斜め移動も自然に表現される）
         float appliedX = ss_rubberband_delta(dx, g_scrollX, 0.0f, g_maxScrollX, RUBBERBAND_COEFF);
@@ -111,14 +117,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_overscrollX = (g_scrollX < 0.0f || g_scrollX > g_maxScrollX);
         g_overscrollY = (g_scrollY < 0.0f || g_scrollY > g_maxScrollY);
 
-        // エッジ検出: 「今フレームで新たに境界外へ入った」場合にのみ、
-        // 慣性を即座に打ち切ってバネへ引き継ぐ。
-        // (壁に到達済みの状態で毎フレーム呼ぶと、慣性の残りデルタとバネが
-        //  同時に位置を書き換え合ってカクつき・巻き戻りの原因になる)
-        bool enteredOverX = g_overscrollX && !g_wasOverX;
-        bool enteredOverY = g_overscrollY && !g_wasOverY;
-        if (enteredOverX || enteredOverY) {
-            ss_cancel_momentum(g_ss);
+        // 境界に「入った瞬間」だけでなく、オーバースクロール中は毎フレーム
+        // 慣性のみを止め続ける(タッチ継続フラグは壊さない ss_stop_inertia を使う)。
+        // ss_cancel_momentum は touching_ まで false にしてしまい、
+        // まだドラッグ中なのにホスト側のバネが誤って起動する競合(=ガクつき)の
+        // 原因になるため、ここでは使わない。
+        if (g_overscrollX || g_overscrollY) {
+            ss_stop_inertia(g_ss);
         }
         g_wasOverX = g_overscrollX;
         g_wasOverY = g_overscrollY;

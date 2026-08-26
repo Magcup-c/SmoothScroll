@@ -28,6 +28,19 @@ constexpr USHORT HID_USAGE_PAGE_DIGITIZER = 0x0D;
 constexpr USHORT HID_USAGE_TOUCH_PAD      = 0x05;
 constexpr ULONGLONG TOUCHPAD_ACTIVITY_WINDOW_MS = 250; // この時間内のRaw Input活動があればタッチパッド由来とみなす
 
+// QueryPerformanceCounter の周波数はプロセス内で不変なので一度だけ取得してキャッシュする。
+// (GetTickCount64は分解能が粗く(既定約15.6ms)、指を離した瞬間の速度計算に使うと
+//  瞬間速度が過大に跳ねて「離した瞬間に飛んでいく」原因になり得るため、
+//  イベント間dtの計算には高分解能タイマを使う)
+LARGE_INTEGER GetQpcFrequency() {
+    static LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    return freq;
+}
+
 struct Instance {
     HWND hwnd = nullptr;
     SS_Config cfg{};
@@ -41,7 +54,8 @@ struct Instance {
     HANDLE wake_event = nullptr;   // デルタ到着で起床
     std::atomic<bool> quit{false};
 
-    ULONGLONG last_tick = 0;       // 前回イベント時刻
+    ULONGLONG last_tick_ms = 0;    // 前回イベント時刻(ms, リリース判定=90ms無入力チェック用)
+    LARGE_INTEGER last_qpc{};      // 前回イベント時刻(高分解能, dt計算用)
     float pending_dx = 0, pending_dy = 0; // 未送出のタッチ中デルタ
 
     std::atomic<ULONGLONG> last_touchpad_raw_tick{0}; // 直近のタッチパッドRaw Input時刻
@@ -134,13 +148,26 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float px = (float)delta / (float)WHEEL_DELTA * inst->cfg.pixel_per_wheel;
 
-        ULONGLONG now = GetTickCount64();
-        float dt;
+        LARGE_INTEGER now_qpc;
+        QueryPerformanceCounter(&now_qpc);
+        ULONGLONG now_ms = GetTickCount64();
+
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            dt = inst->last_tick ? (float)(now - inst->last_tick) / 1000.0f : 1.0f / 60.0f;
-            inst->last_tick = now;
-            if (dt > 0.25f) dt = 1.0f / 60.0f;
+
+            float dt;
+            if (inst->last_tick_ms == 0) {
+                dt = 1.0f / 60.0f;
+            } else {
+                LARGE_INTEGER freq = GetQpcFrequency();
+                LONGLONG diff_ticks = now_qpc.QuadPart - inst->last_qpc.QuadPart;
+                dt = (freq.QuadPart > 0)
+                    ? (float)((double)diff_ticks / (double)freq.QuadPart)
+                    : 1.0f / 60.0f;
+                if (dt > 0.25f) dt = 1.0f / 60.0f;
+            }
+            inst->last_tick_ms = now_ms;
+            inst->last_qpc = now_qpc;
 
             if (msg == WM_POINTERWHEEL)
                 inst->engine.feedDelta(0, px, dt);
@@ -158,7 +185,7 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     case WM_TIMER:
         if (wParam == SUBCLASS_ID) {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            if (GetTickCount64() - inst->last_tick > 90) {
+            if (GetTickCount64() - inst->last_tick_ms > 90) {
                 inst->engine.release();
                 KillTimer(hwnd, SUBCLASS_ID);
                 SetEvent(inst->wake_event);

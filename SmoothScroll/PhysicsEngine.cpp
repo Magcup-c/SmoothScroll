@@ -4,7 +4,7 @@
 
 PhysicsEngine::PhysicsEngine(const SS_Config& cfg) : cfg_(cfg) {}
 
-void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec) {
+void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec, bool update_x, bool update_y) {
     touching_ = true;
     momentum_ = false;
 
@@ -25,8 +25,18 @@ void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec) {
         }
 
         float a = cfg_.velocity_ema;
-        vx_ = vx_ * (1.0f - a) + ivx * a;
-        vy_ = vy_ * (1.0f - a) + ivy * a;
+        // 更新対象の軸はEMAで平滑化して反映する。
+        // 更新対象でない軸は「完全に凍結」ではなく、慣性と同じ指数減衰で
+        // 緩やかにフェードさせる。完全凍結だと、軸ロックが長く続いた後に
+        // 古い速度がいきなり慣性に反映されて不自然になるため。
+        // (Precision Touchpadの軸ロックで片方の軸のイベントが一時的に
+        //  来なくなった時、その軸の速度をなだらかに減衰させることで
+        //  強制的に0へ引っ張る/いつまでも凍結する、両方の不自然さを避ける)
+        float decay = std::exp(-cfg_.decay_rate * dt_sec);
+        if (update_x) vx_ = vx_ * (1.0f - a) + ivx * a;
+        else          vx_ *= decay;
+        if (update_y) vy_ = vy_ * (1.0f - a) + ivy * a;
+        else          vy_ *= decay;
     }
 }
 
@@ -74,6 +84,29 @@ bool PhysicsEngine::step(float dt_sec, float& out_dx, float& out_dy) {
     out_dx = ix; out_dy = iy;
 
     return momentum_ || (ix != 0 || iy != 0);
+}
+
+bool PhysicsEngine::stepContinuous(float dt_sec, float& out_dx, float& out_dy) {
+    out_dx = out_dy = 0;
+    if (!momentum_) return false;
+
+    // step()と全く同じ減衰計算だが、整数丸め・端数繰り越しを行わない。
+    // ズームのスケール値(対数空間)のような、量子化してはいけない値のための経路。
+    float decay = std::exp(-cfg_.decay_rate * dt_sec);
+
+    out_dx = vx_ * dt_sec;
+    out_dy = vy_ * dt_sec;
+
+    vx_ *= decay;
+    vy_ *= decay;
+
+    float speed = std::sqrt(vx_ * vx_ + vy_ * vy_);
+    if (speed < cfg_.stop_velocity) {
+        vx_ = vy_ = 0;
+        momentum_ = false;
+    }
+
+    return momentum_ || (out_dx != 0.0f || out_dy != 0.0f);
 }
 
 void PhysicsEngine::cancel() {

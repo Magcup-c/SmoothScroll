@@ -19,6 +19,16 @@ extern "C" {
 // 回してください）
 typedef void (CALLBACK *SS_ScrollCallback)(float dx, float dy, void* user);
 
+// ピンチズームのスムーズ化されたスケール変化を受け取るコールバック。
+// scale_factor: このフレームで現在のズーム倍率に乗算すべき係数(例: 1.002 = +0.2%)。
+//               1.0が「変化なし」。ホスト側は自身のズーム倍率にこれを掛け合わせて更新すること
+//               (加算ではなく乗算である点に注意。指数減衰モデルとの相性のため)。
+// anchor_x, anchor_y: ズーム操作の中心点(クライアント座標)。
+//               ホスト側で「この点を中心にズームする」処理に使う。
+// user: ss_attach で渡した任意ポインタ
+// 呼び出しスレッド: SS_ScrollCallback と同じ物理ループスレッド
+typedef void (CALLBACK *SS_ZoomCallback)(float scale_factor, float anchor_x, float anchor_y, void* user);
+
 typedef struct SS_Config {
     float decay_rate;        // 慣性の減衰率 [/sec]。大きいほど早く止まる。既定 4.0 (Mac風は 3.0〜5.0)
     float velocity_ema;      // 指速度推定のEMA係数 (0..1]。小さいほど滑らかだが追従が鈍い。既定 0.35
@@ -27,6 +37,26 @@ typedef struct SS_Config {
     float pixel_per_wheel;   // ホイールデルタ120あたりのピクセル換算。既定 100.0
     BOOL  enable_horizontal; // 横スクロールも処理するか。既定 TRUE
     BOOL  pass_through_wheel;// 通常マウスホイールをスムーズ化せず素通しするか。既定 TRUE
+
+    // ---- ピンチズーム関連 ----
+    // Precision Touchpad は、アプリが生のマルチタッチ/DirectManipulation等に
+    // 対応していないと判断すると、ピンチ動作を「Ctrl+ホイール」の互換シグナルとして
+    // 送ってくる。本ライブラリはこの経路を利用してズームを検出する。
+    //
+    // 実機検証の結果:
+    //   - EnableMouseInPointer(TRUE) 環境下では、このCtrl相当のシグナルは
+    //     WM_POINTERWHEEL/HWHEEL のwParamには乗らない(常にno)。
+    //   - GetKeyState(VK_CONTROL) も、Ctrlキー物理押下時ですら数回で
+    //     途切れることがあり信頼できなかった。
+    //   - GetAsyncKeyState(VK_CONTROL) で毎回直接OSに問い合わせる方式が
+    //     最も安定していることが実機検証で確認された
+    //     (純粋なパン動作では反応せず、実際のピンチ動作でのみ高頻度でYESになる)。
+    //   そのためライブラリ内部では GetAsyncKeyState を使用している。
+    BOOL  enable_zoom;        // ピンチズームを有効にするか。既定 FALSE
+    float zoom_step;          // ホイールデルタ120あたりの対数スケール増分。既定 0.10 (約10%相当/クリック)
+    float zoom_decay_rate;    // ズーム慣性の減衰率 [/sec]。既定 4.0
+    float zoom_stop_velocity; // この対数速度未満で完全停止。既定 0.05
+    float zoom_max_velocity;  // 初速クランプ(対数速度)。既定 6.0
 } SS_Config;
 
 // 既定値入りの設定を取得
@@ -36,7 +66,8 @@ SS_API void ss_default_config(SS_Config* cfg);
 // 成功: ハンドル(非NULL) / 失敗: NULL
 // hwnd には SetWindowSubclass でサブクラス化を行い、
 // タッチパッド由来の WM_POINTERWHEEL/HWHEEL を捕捉して慣性化する。
-SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, void* user);
+// cb_zoom: cfg->enable_zoom が TRUE の場合に呼ばれるズームコールバック。不要な場合は nullptr でよい。
+SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, SS_ZoomCallback cb_zoom, void* user);
 
 // 取り外し。物理スレッド停止とサブクラス解除を行う。
 SS_API void ss_detach(HANDLE h);

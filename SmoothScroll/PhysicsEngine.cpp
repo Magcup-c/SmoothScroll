@@ -4,9 +4,15 @@
 
 PhysicsEngine::PhysicsEngine(const SS_Config& cfg) : cfg_(cfg) {}
 
-void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec, bool update_x, bool update_y) {
+void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec, float freeze_dt_sec,
+                               bool update_x, bool update_y) {
     touching_ = true;
     momentum_ = false;
+
+    // freeze_dt_sec が省略(負値)された場合は dt_sec を使う
+    // (ズーム用途など、update_x/update_yを両方trueで呼ぶ場合はそもそも
+    //  減衰分岐に入らないため実質未使用)。
+    if (freeze_dt_sec < 0.0f) freeze_dt_sec = dt_sec;
 
     // タッチ中は生デルタをそのまま消費側へ渡すため速度だけ推定する。
     // 瞬間速度をEMAで平滑化（ノイズの多いタッチパッドのデルタを滑らかに）
@@ -39,13 +45,19 @@ void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec, bool update_x, b
         }
 
         // 更新対象の軸はEMAで平滑化して反映する。
-        // 更新対象でない軸は「完全に凍結」ではなく、慣性と同じ指数減衰で
-        // 緩やかにフェードさせる。完全凍結だと、軸ロックが長く続いた後に
-        // 古い速度がいきなり慣性に反映されて不自然になるため。
-        // (Precision Touchpadの軸ロックで片方の軸のイベントが一時的に
-        //  来なくなった時、その軸の速度をなだらかに減衰させることで
-        //  強制的に0へ引っ張る/いつまでも凍結する、両方の不自然さを避ける)
-        float decay = std::exp(-cfg_.decay_rate * dt_sec);
+        // 更新対象でない軸(軸ロックで凍結中)は「完全に凍結」ではなく、
+        // 慣性と同じ指数減衰で緩やかにフェードさせる。完全凍結だと、
+        // 軸ロックが長く続いた後に古い速度がいきなり慣性に反映されて
+        // 不自然になるため。
+        //
+        // 重要: この減衰には dt_sec ではなく freeze_dt_sec を使う。
+        // dt_sec は「今更新される側の軸」の前回イベントからの経過時間で
+        // あり、凍結側の軸にとっては無関係な値(軸ロック解除の瞬間には
+        // 実際より大きくズレる)。freeze_dt_sec は「縦横どちらでもよいので
+        // 前回イベントからの経過時間」であるべきで、これを使わないと
+        // 軸ロックが切り替わった瞬間に凍結側の速度が一気にガクッと
+        // 減衰してしまう(=軸切り替え時のカクつきの原因)。
+        float decay = std::exp(-cfg_.decay_rate * freeze_dt_sec);
         if (update_x) vx_ = vx_ * (1.0f - a) + ivx * a;
         else          vx_ *= decay;
         if (update_y) vy_ = vy_ * (1.0f - a) + ivy * a;

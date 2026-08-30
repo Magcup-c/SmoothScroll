@@ -16,25 +16,14 @@ namespace {
 
 constexpr UINT_PTR SUBCLASS_ID      = 0x53534D4B; // 'SSMK'
 
-// 重要: これらのタイマーIDは ss_attach 先の HWND に対して SetTimer/KillTimer される。
-// ホストアプリが同じ HWND に対して独自の SetTimer(hwnd, 1, ...) のような
-// 小さい/衝突しやすいIDを使っていた場合、SubclassProc がホストより先に
-// WM_TIMER を横取りして必ず return 0 してしまうため、ホスト側のタイマーハンドラに
-// メッセージが一切届かなくなるという実害のあるバグを踏む(実際に踏んだ)。
-// そのため、一般的なアプリが使うことがまずないユニークな値にしてある。
 constexpr UINT_PTR PAN_TIMER_ID     = 0x53534D01; // パン用: 90ms無入力でリリース判定
 constexpr UINT_PTR ZOOM_TIMER_ID    = 0x53534D02; // ズーム用: 同様に90ms無入力でリリース判定
 constexpr UINT     WM_SS_WAKE       = WM_APP + 0x53; // 物理ループ起床用
 
-// Precision Touchpad は HID Digitizer コレクション
-// (Usage Page 0x0D = Digitizers, Usage 0x05 = Touch Pad) として
-// Raw Input を送り続ける。この専用チャンネルでの活動有無を
-// 「タッチパッドかどうか」の判定材料に使う。
 constexpr USHORT HID_USAGE_PAGE_DIGITIZER = 0x0D;
 constexpr USHORT HID_USAGE_TOUCH_PAD      = 0x05;
 constexpr ULONGLONG TOUCHPAD_ACTIVITY_WINDOW_MS = 250;
 
-// QueryPerformanceCounter の周波数はプロセス内で不変なので一度だけ取得してキャッシュする。
 LARGE_INTEGER GetQpcFrequency() {
     static LARGE_INTEGER freq = [] {
         LARGE_INTEGER f;
@@ -44,8 +33,6 @@ LARGE_INTEGER GetQpcFrequency() {
     return freq;
 }
 
-// ズーム用の物理エンジンには、パン用とは別の減衰・停止しきい値を使う
-// (対数スケール空間の値はピクセル空間と単位のスケール感が全く異なるため)。
 SS_Config MakeZoomPhysicsConfig(const SS_Config& c) {
     SS_Config zc = c;
     zc.decay_rate    = c.zoom_decay_rate;
@@ -56,21 +43,6 @@ SS_Config MakeZoomPhysicsConfig(const SS_Config& c) {
 
 // ============================================================
 // ラバーバンド圧縮曲線 f(o) = coeff*o / (coeff+o)
-// 「真の(未圧縮)オーバースクロール量 o」を「見た目上の圧縮された変位」に
-// マッピングする単調増加関数(値域は [0, coeff) に漸近)。
-// RubberbandExpand() はその逆関数で、現在の見た目上の変位から
-// 真のオーバースクロール量を復元する。
-//
-// 以前の実装は「既にオーバースクロール中」と「今フレームで境界を超えた」で
-// 別々の式を使っており、overshoot が 0 をまたぐ瞬間に抵抗のかかり方が
-// 不連続にジャンプしていた(境界ちょうどでは強く抵抗するのに、その1フレーム後
-// にはほぼ無抵抗になる、など)。さらに「戻る方向は常に無抵抗で素通し」という
-// 特殊扱いもあり、押す/戻すの切り替え時に速度が不連続に変化していた。
-// これらが「端でカクつく/ジャンプする」という体感の原因だった。
-//
-// 修正版は常にこの1本の曲線だけを使い、押し込み/戻し/境界またぎの
-// すべてのケースを「仮想オーバースクロール量に delta を加算してから
-// 再度圧縮する」という同一の式で扱うことで連続性を保証する。
 // ============================================================
 inline float RubberbandCompress(float o, float coeff) {
     if (o <= 0.0f) return 0.0f;
@@ -79,8 +51,6 @@ inline float RubberbandCompress(float o, float coeff) {
 
 inline float RubberbandExpand(float d, float coeff) {
     if (d <= 0.0f) return 0.0f;
-    // f の値域は [0, coeff) なので、数値誤差で d >= coeff になった場合の
-    // ゼロ除算/負値化を防ぐ安全策。
     if (d >= coeff) d = coeff * 0.999999f;
     return coeff * d / (coeff - d);
 }
@@ -97,17 +67,27 @@ struct Instance {
     std::mutex mtx;
 
     HANDLE thread = nullptr;
-    HANDLE wake_event = nullptr;   // デルタ到着で起床
+    HANDLE wake_event = nullptr;   // 慣性/バネフェーズの起床用(タッチ中の生デルタはもう経由しない)
     std::atomic<bool> quit{false};
 
-    ULONGLONG last_tick_ms = 0;    // 前回パンイベント時刻(ms, リリース判定用)
-    LARGE_INTEGER last_qpc{};      // 前回パンイベント時刻(高分解能, dt計算用)
-    float pending_dx = 0, pending_dy = 0; // 未送出のタッチ中パンデルタ
+    // リリース判定(PAN_TIMER)専用: 縦横どちらの軸のイベントでも更新される
+    // 「直近のパン活動時刻」。90ms操作なしで release() する判定にのみ使う。
+    ULONGLONG last_tick_ms = 0;
+
+    // 「凍結側の軸を減衰させる」ために使う、縦横共通の高分解能時刻。
+    LARGE_INTEGER last_shared_qpc{};
+
+    // 速度推定(EMA)専用: 縦横それぞれ独立に持つ「同じ軸の前回イベントからの
+    // 経過時間」計算用。凍結側の減衰に流用してはいけない
+    // (詳細はPhysicsEngine::feedDeltaのコメント参照)。
+    ULONGLONG last_v_tick_ms = 0;    // 直近の縦(WM_POINTERWHEEL)イベント時刻
+    LARGE_INTEGER last_v_qpc{};
+    ULONGLONG last_h_tick_ms = 0;    // 直近の横(WM_POINTERHWHEEL)イベント時刻
+    LARGE_INTEGER last_h_qpc{};
 
     ULONGLONG last_zoom_tick_ms = 0; // 前回ズームイベント時刻(ms)
     LARGE_INTEGER last_zoom_qpc{};   // 前回ズームイベント時刻(高分解能)
-    float pending_zoom_log = 0;      // 未送出のズーム対数デルタ
-    float zoom_anchor_x = 0, zoom_anchor_y = 0; // ズーム中心点(クライアント座標)
+    float zoom_anchor_x = 0, zoom_anchor_y = 0; // ズーム中心点(クライアント座標、慣性フェーズが参照する)
 
     std::atomic<ULONGLONG> last_touchpad_raw_tick{0}; // 直近のタッチパッドRaw Input時刻
     bool raw_input_registered = false;
@@ -119,6 +99,11 @@ struct Instance {
 // ---- 物理ループスレッド --------------------------------------------------
 // 高分解能ウェイタブルタイマでディスプレイ周期(既定60Hz相当)に駆動。
 // アイドル時はイベント待機でCPUを消費しない。
+//
+// 重要: タッチ中の生デルタの1:1パス送出は、ここではなくSubclassProcから
+// 直接コールバックを呼ぶように変更した(レイテンシ削減のため)。
+// このスレッドが担当するのは、指が離れた後の慣性/バネへ引き継がれた後の
+// 「時間駆動で計算が必要なアニメーション」だけである。
 DWORD WINAPI PhysicsThread(LPVOID param) {
     Instance* inst = static_cast<Instance*>(param);
 
@@ -148,19 +133,7 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
         DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
         if (inst->quit.load()) break;
 
-        // ---- パン: タッチ中の生デルタをそのまま送出 ----
-        float tdx = 0, tdy = 0;
-        {
-            std::lock_guard<std::mutex> lk(inst->mtx);
-            tdx = inst->pending_dx; tdy = inst->pending_dy;
-            inst->pending_dx = inst->pending_dy = 0;
-        }
-        if (tdx != 0 || tdy != 0)
-            inst->cb(tdx, tdy, inst->user);
-
         // ---- パン: 慣性フェーズ ----
-        // pan_subpixel が有効なら整数丸めをしない stepContinuous() を使い、
-        // 慣性終盤の量子化ジッター(「ピタッ…ピタッ」という1px刻みの飛び)を回避する。
         float mdx = 0, mdy = 0;
         bool panActive;
         {
@@ -172,27 +145,15 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
         if (mdx != 0 || mdy != 0)
             inst->cb(mdx, mdy, inst->user);
 
-        // ---- ズーム: タッチ(ホイール操作)中の生デルタをそのまま送出 ----
-        float tzoom = 0;
-        float zoomAnchorX = 0, zoomAnchorY = 0;
-        {
-            std::lock_guard<std::mutex> lk(inst->mtx);
-            tzoom = inst->pending_zoom_log;
-            inst->pending_zoom_log = 0;
-            zoomAnchorX = inst->zoom_anchor_x;
-            zoomAnchorY = inst->zoom_anchor_y;
-        }
-        if (tzoom != 0 && inst->cb_zoom) {
-            float scaleFactor = std::exp(tzoom);
-            inst->cb_zoom(scaleFactor, zoomAnchorX, zoomAnchorY, inst->user);
-        }
-
         // ---- ズーム: 慣性フェーズ(対数空間で減衰させ、exp()で倍率に戻す) ----
         float mzoom = 0, dummy = 0;
         bool zoomActive;
+        float zoomAnchorX, zoomAnchorY;
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
             zoomActive = inst->zoom_engine.stepContinuous(frame_dt, mzoom, dummy);
+            zoomAnchorX = inst->zoom_anchor_x;
+            zoomAnchorY = inst->zoom_anchor_y;
         }
         if (mzoom != 0.0f && inst->cb_zoom) {
             float scaleFactor = std::exp(mzoom);
@@ -240,6 +201,7 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                 LARGE_INTEGER now_qpc;
                 QueryPerformanceCounter(&now_qpc);
                 ULONGLONG now_ms = GetTickCount64();
+                float scaleFactor;
 
                 {
                     std::lock_guard<std::mutex> lk(inst->mtx);
@@ -258,11 +220,13 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                     inst->last_zoom_qpc = now_qpc;
 
                     inst->zoom_engine.feedDelta(logStep, 0, dt);
-                    inst->pending_zoom_log += logStep;
                     inst->zoom_anchor_x = (float)pt.x;
                     inst->zoom_anchor_y = (float)pt.y;
+                    scaleFactor = std::exp(logStep);
                 }
-                SetEvent(inst->wake_event);
+                // タッチ(ホイール操作)中の生デルタは、物理ループスレッドの
+                // 起床待ちを挟まず、このスレッドから直接コールバックを呼ぶ。
+                inst->cb_zoom(scaleFactor, pt.x, pt.y, inst->user);
                 SetTimer(hwnd, ZOOM_TIMER_ID, 90, nullptr);
                 return 0; // パンとしては処理しない
             }
@@ -283,29 +247,52 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
 
+            LARGE_INTEGER freq = GetQpcFrequency();
+
+            // (1) 速度推定用dt: 「同じ軸の」前回イベントからの経過時間。
+            bool isVertical = (msg == WM_POINTERWHEEL);
+            ULONGLONG& lastAxisTickMs = isVertical ? inst->last_v_tick_ms : inst->last_h_tick_ms;
+            LARGE_INTEGER& lastAxisQpc = isVertical ? inst->last_v_qpc : inst->last_h_qpc;
+
             float dt;
-            if (inst->last_tick_ms == 0) {
+            if (lastAxisTickMs == 0) {
                 dt = 1.0f / 60.0f;
             } else {
-                LARGE_INTEGER freq = GetQpcFrequency();
-                LONGLONG diff_ticks = now_qpc.QuadPart - inst->last_qpc.QuadPart;
+                LONGLONG diff_ticks = now_qpc.QuadPart - lastAxisQpc.QuadPart;
                 dt = (freq.QuadPart > 0)
                     ? (float)((double)diff_ticks / (double)freq.QuadPart)
                     : 1.0f / 60.0f;
                 if (dt > 0.25f) dt = 1.0f / 60.0f;
             }
+            lastAxisTickMs = now_ms;
+            lastAxisQpc = now_qpc;
+
+            // (2) 凍結側減衰用dt: 縦横どちらのイベントでもよい、前回呼び出しからの経過時間。
+            float freezeDt;
+            if (inst->last_shared_qpc.QuadPart == 0) {
+                freezeDt = 1.0f / 60.0f;
+            } else {
+                LONGLONG diff_ticks = now_qpc.QuadPart - inst->last_shared_qpc.QuadPart;
+                freezeDt = (freq.QuadPart > 0)
+                    ? (float)((double)diff_ticks / (double)freq.QuadPart)
+                    : 1.0f / 60.0f;
+                if (freezeDt > 0.25f) freezeDt = 1.0f / 60.0f;
+            }
+            inst->last_shared_qpc = now_qpc;
+
             inst->last_tick_ms = now_ms;
-            inst->last_qpc = now_qpc;
 
             if (msg == WM_POINTERWHEEL)
-                inst->engine.feedDelta(0, px, dt, /*update_x=*/false, /*update_y=*/true);
+                inst->engine.feedDelta(0, px, dt, freezeDt, /*update_x=*/false, /*update_y=*/true);
             else
-                inst->engine.feedDelta(px, 0, dt, /*update_x=*/true, /*update_y=*/false);
-
-            if (msg == WM_POINTERWHEEL) inst->pending_dy += px;
-            else                        inst->pending_dx += px;
+                inst->engine.feedDelta(px, 0, dt, freezeDt, /*update_x=*/true, /*update_y=*/false);
         }
-        SetEvent(inst->wake_event);
+
+        // タッチ中の生デルタは物理ループスレッドを経由させず、このスレッドから
+        // 直接コールバックを呼ぶ(1:1パス動作に不要な1往復分のレイテンシを削る)。
+        if (msg == WM_POINTERWHEEL) inst->cb(0, px, inst->user);
+        else                        inst->cb(px, 0, inst->user);
+
         SetTimer(hwnd, PAN_TIMER_ID, 30, nullptr);
         return 0;
     }
@@ -325,6 +312,7 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         LARGE_INTEGER now_qpc;
         QueryPerformanceCounter(&now_qpc);
         ULONGLONG now_ms = GetTickCount64();
+        float scaleFactor;
 
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
@@ -343,11 +331,11 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
             inst->last_zoom_qpc = now_qpc;
 
             inst->zoom_engine.feedDelta(logStep, 0, dt);
-            inst->pending_zoom_log += logStep;
             inst->zoom_anchor_x = (float)pt.x;
             inst->zoom_anchor_y = (float)pt.y;
+            scaleFactor = std::exp(logStep);
         }
-        SetEvent(inst->wake_event);
+        inst->cb_zoom(scaleFactor, pt.x, pt.y, inst->user);
         SetTimer(hwnd, ZOOM_TIMER_ID, 90, nullptr);
         return 0;
     }

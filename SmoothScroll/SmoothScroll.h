@@ -18,8 +18,16 @@ extern "C" {
 //   TRUE の場合は慣性フェーズも浮動小数点のサブピクセル値になる
 //   (ホスト側がfloatでスクロール位置を保持できる場合に量子化ジッターを避けられる)。
 // user: ss_attach で渡した任意ポインタ
-// 呼び出しスレッド: DLL内部の物理ループスレッド（UI更新はPostMessage等でUIスレッドへ
-// 回してください）
+//
+// 呼び出しスレッド: 一律ではない点に注意。
+//   - タッチ中(指でなぞっている間)の生デルタ: 入力メッセージ(WM_POINTERWHEEL等)を
+//     受け取ったスレッド(通常はUIスレッド)から同期的に直接呼ばれる。
+//     待ち時間なく即座に反映したいだけの1:1パス動作のために、あえて
+//     DLL内部の物理ループスレッドを経由させず、レイテンシを削っている。
+//   - 慣性/バネ引き継ぎ後のアニメーションフェーズ: DLL内部の物理ループスレッドから呼ばれる。
+//   いずれの場合も、ホスト側でUIを直接更新するのではなく、PostMessage等で
+//   UIスレッドの管理下に処理を戻すこと(タッチ中の直接呼び出しがUIスレッド自身から
+//   来ている場合も、他のスレッドから来る場合と同じ経路で処理できるように統一するため)。
 typedef void (CALLBACK *SS_ScrollCallback)(float dx, float dy, void* user);
 
 // ピンチズームのスムーズ化されたスケール変化を受け取るコールバック。
@@ -29,7 +37,10 @@ typedef void (CALLBACK *SS_ScrollCallback)(float dx, float dy, void* user);
 // anchor_x, anchor_y: ズーム操作の中心点(クライアント座標)。
 //               ホスト側で「この点を中心にズームする」処理に使う。
 // user: ss_attach で渡した任意ポインタ
-// 呼び出しスレッド: SS_ScrollCallback と同じ物理ループスレッド
+//
+// 呼び出しスレッド: SS_ScrollCallback と同様、タッチ中(ホイール操作中)は
+// 入力メッセージを受け取ったスレッドから直接、慣性フェーズはDLL内部の
+// 物理ループスレッドから呼ばれる。
 typedef void (CALLBACK *SS_ZoomCallback)(float scale_factor, float anchor_x, float anchor_y, void* user);
 
 typedef struct SS_Config {
@@ -144,10 +155,6 @@ SS_API void ss_set_invert(HANDLE h, BOOL invert_vertical, BOOL invert_horizontal
 // min_pos, max_pos : コンテンツの許容範囲
 // coeff     : 抵抗係数。小さいほど強く抵抗する。既定推奨値 0.55
 // 戻り値    : 実際に pos へ加算すべき移動量
-//
-// 注意: 既にオーバースクロール中(overshoot > 0)の場合、境界へ「戻ろうとする」
-// 方向の delta には抵抗をかけない(そのまま通す)。押し込む方向のみ抵抗する
-// 非対称な挙動にしてある。
 SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, float max_pos, float coeff);
 
 // pos を target（境界内の最近接位置など）へバネで近づける1ステップ。

@@ -16,7 +16,24 @@ public:
     explicit PhysicsEngine(const SS_Config& cfg);
 
     // 生のタッチパッドデルタを入力（タッチ中）
-    // dx, dy: ピクセル換算済みデルタ, dt_sec: 前回イベントからの経過秒
+    // dx, dy: ピクセル換算済みデルタ, dt_sec: 前回「同じ軸の」イベントからの経過秒
+    // freeze_dt_sec: 更新されない軸(update_x/update_yがfalseの軸)を減衰させる際に
+    //   使う経過秒。「前回、縦横どちらかのイベントが来てからの経過時間」を渡すこと。
+    //   省略(負値)した場合は dt_sec をそのまま使う(後方互換/ズーム用途向け)。
+    //
+    //   重要: dt_sec と freeze_dt_sec を混同してはいけない。
+    //   Precision TouchpadはWM_POINTERWHEEL(縦)とWM_POINTERHWHEEL(横)が
+    //   別々のメッセージで届くため、軸ロックで例えば縦だけイベントが
+    //   来ている間、横軸は「前回の横イベントからの経過時間」で見ると
+    //   実際には何十msも間が空いていることがある。
+    //   もしこの「同じ軸基準の長い間隔」を凍結側(横)の減衰計算にそのまま
+    //   使ってしまうと、ロックが外れて久しぶりに横イベントが来た瞬間、
+    //   横軸の減衰が一気にドカッと効いてしまい(本来はロック中もなだらかに
+    //   減衰し続けているべきなのに)、軸切り替えの瞬間だけ速度が不自然に
+    //   カクつく原因になる(実際に踏んだ)。
+    //   そのため凍結側の減衰には「縦横どちらのイベントでもよいので前回の
+    //   呼び出しからの経過時間」を渡す必要がある。
+    //
     // update_x, update_y: この呼び出しで実際に値が更新された軸かどうか。
     //   Precision TouchpadはWM_POINTERWHEEL(縦)とWM_POINTERHWHEEL(横)が
     //   別々のメッセージで届くため、片方の軸のイベントしか来ていない時に
@@ -24,7 +41,8 @@ public:
     //   かもしれないのに強制的にゼロへ引っ張られてしまう
     //   (OSの軸ロックがかかった瞬間に「カクッ」と不自然に感じる原因)。
     //   このフラグをfalseにした軸は速度を変更せず、そのまま維持する。
-    void feedDelta(float dx, float dy, float dt_sec, bool update_x = true, bool update_y = true);
+    void feedDelta(float dx, float dy, float dt_sec, float freeze_dt_sec = -1.0f,
+                   bool update_x = true, bool update_y = true);
 
     // タッチ終了 → 慣性フェーズ開始
     void release();
@@ -40,7 +58,7 @@ public:
     bool step(float dt_sec, float& out_dx, float& out_dy);
 
     // step() の連続値版: 整数ピクセルへの丸め・端数繰り越しを行わない。
-    // パンのピクセル位置と違い、ズームのスケール値(対数空間の位置として扱う)は
+    // ズームのスケール値(対数空間の位置として扱う)は
     // 丸めると精度が失われ、特に慣性の終盤で不自然にカクつく。
     // 速度・減衰の計算ロジック自体は step() と全く同じ(同じ vx_/vy_ 状態を使う)。
     // ズーム用途では dy チャンネルは使わず 0 のまま渡してよい(1次元として使う)。

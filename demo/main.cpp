@@ -16,7 +16,6 @@
 
 namespace {
     // ---- グリッドレイアウト（縦横スクロールを見せるため2次元に配置） ----
-    // これらは「コンテンツ座標系」の値。画面には (値 - スクロール) * ズーム倍率 で描画する。
     constexpr int GRID_COLS   = 3;
     constexpr int GRID_ROWS   = 20;
     constexpr int CARD_W      = 260;
@@ -25,14 +24,12 @@ namespace {
     constexpr int MARGIN      = 40;
     constexpr int TOP_PAD     = 24;
 
-    // ---- スクロール状態（縦横それぞれ独立して保持、コンテンツ座標系） ----
     float g_scrollX = 0, g_scrollY = 0;
     float g_maxScrollX = 0, g_maxScrollY = 0;
     bool  g_overscrollX = false, g_overscrollY = false;
 
     bool g_wasOverX = false, g_wasOverY = false;
 
-    // ---- ズーム状態 ----
     float g_zoomScale = 1.0f;
     constexpr float ZOOM_MIN = 0.3f;
     constexpr float ZOOM_MAX = 3.0f;
@@ -41,16 +38,16 @@ namespace {
     float g_springVelX = 0.0f, g_springVelY = 0.0f;
 
     constexpr UINT_PTR SPRING_TIMER_ID = 1;
-    constexpr UINT     SPRING_TIMER_MS = 16; // 約60Hz
+    constexpr UINT     SPRING_TIMER_MS = 16;
     constexpr float    RUBBERBAND_COEFF = 0.55f;
     constexpr float    SPRING_STIFFNESS = 220.0f;
     constexpr float    SPRING_DAMPING   = 22.0f;
     constexpr float    SPRING_POS_EPS   = 0.4f;
     constexpr float    SPRING_VEL_EPS   = 4.0f;
+    constexpr float    MAX_OVERSCROLL   = 60.0f;
 
     HFONT g_font = nullptr;
 
-    // ---- ダブルバッファリング用 ----
     HBITMAP g_memBitmap = nullptr;
     HDC     g_memDC = nullptr;
     int     g_memW = 0, g_memH = 0;
@@ -70,21 +67,18 @@ namespace {
         RECT rc; GetClientRect(hwnd, &rc);
         int contentW = MARGIN * 2 + GRID_COLS * CARD_W + (GRID_COLS - 1) * GAP;
         int contentH = TOP_PAD * 2 + GRID_ROWS * CARD_H + (GRID_ROWS - 1) * GAP;
-        // ビューポートの幅/高さはズーム倍率で「コンテンツ座標系」に換算してから比較する。
         float viewW = (float)(rc.right - rc.left) / g_zoomScale;
         float viewH = (float)(rc.bottom - rc.top) / g_zoomScale;
         g_maxScrollX = max(0.0f, (float)contentW - viewW);
         g_maxScrollY = max(0.0f, (float)contentH - viewH);
     }
 
-    // コンテンツ座標 → 画面座標(ズーム適用込み)
     inline float ContentToScreenX(float contentX) { return (contentX - g_scrollX) * g_zoomScale; }
     inline float ContentToScreenY(float contentY) { return (contentY - g_scrollY) * g_zoomScale; }
+
+    inline int RoundPx(float v) { return (int)std::lround(v); }
 }
 
-// DLLの物理スレッドから呼ばれる → UIスレッドへ転送
-// float→整数ハンドルの詰め替えはポインタ再解釈(strict-aliasing違反/UB)ではなく
-// memcpyでビットパターンをそのままコピーする(結果は同じだが未定義動作を避けられる)
 void CALLBACK OnScroll(float dx, float dy, void* user) {
     HWND hwnd = (HWND)user;
     int32_t packed_x, packed_y;
@@ -93,10 +87,6 @@ void CALLBACK OnScroll(float dx, float dy, void* user) {
     PostMessageW(hwnd, WM_APP + 1, (WPARAM)(intptr_t)packed_x, (LPARAM)(intptr_t)packed_y);
 }
 
-// ズーム用コールバック。scale_factor(乗算係数)とアンカー座標(クライアント座標)を
-// WM_APP+2 としてUIスレッドへ転送する。
-// scale_factor, anchor_x, anchor_yの3つのfloatをヒープに確保して渡す
-// (WPARAM/LPARAMの32bit幅にまとめて詰め込むのは無理があるため)。
 void CALLBACK OnZoom(float scale_factor, float anchor_x, float anchor_y, void* user) {
     HWND hwnd = (HWND)user;
 
@@ -116,7 +106,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Yu Gothic UI");
 
         SS_Config cfg; ss_default_config(&cfg);
-        cfg.enable_zoom = TRUE; // Ctrl+ホイール(ピンチ互換シグナル)によるズームを有効化
+        cfg.enable_zoom = TRUE;
+        cfg.pan_subpixel = TRUE;
+        cfg.invert_vertical = TRUE;
+
         g_ss = ss_attach(hwnd, &cfg, OnScroll, OnZoom, hwnd);
 
         RecalcMaxScroll(hwnd);
@@ -136,8 +129,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         std::memcpy(&dx, &packed_x, sizeof(float));
         std::memcpy(&dy, &packed_y, sizeof(float));
 
-        // ラバーバンドはコンテンツ座標系で計算するため、画面ピクセル量のdx/dyを
-        // ズーム倍率で割ってコンテンツ座標系の移動量に変換する。
         float contentDx = dx / g_zoomScale;
         float contentDy = dy / g_zoomScale;
 
@@ -145,16 +136,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         float appliedY = ss_rubberband_delta(contentDy, g_scrollY, 0.0f, g_maxScrollY, RUBBERBAND_COEFF);
         g_scrollX += appliedX;
         g_scrollY += appliedY;
+
+        g_scrollX = max(-MAX_OVERSCROLL, min(g_maxScrollX + MAX_OVERSCROLL, g_scrollX));
+        g_scrollY = max(-MAX_OVERSCROLL, min(g_maxScrollY + MAX_OVERSCROLL, g_scrollY));
+
         g_springVelX = g_springVelY = 0.0f;
 
         g_overscrollX = (g_scrollX < 0.0f || g_scrollX > g_maxScrollX);
         g_overscrollY = (g_scrollY < 0.0f || g_scrollY > g_maxScrollY);
 
-        // 境界に「入った瞬間」だけでなく、オーバースクロール中は毎フレーム
-        // 慣性のみを止め続ける(タッチ継続フラグは壊さない ss_stop_inertia を使う)。
-        // ss_cancel_momentum は touching_ まで false にしてしまい、
-        // まだドラッグ中なのにホスト側のバネが誤って起動する競合(=ガクつき)の
-        // 原因になるため、ここでは使わない。
         if (g_overscrollX || g_overscrollY) {
             ss_stop_inertia(g_ss);
         }
@@ -172,9 +162,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         float anchorY = payload[2];
         delete[] payload;
 
-        // アンカー(カーソル位置)を中心に拡大縮小する:
-        // 「アンカー直下のコンテンツ座標」が拡縮の前後で画面上の同じ位置に
-        // 留まるように scrollX/Y を再計算する。
         float contentAnchorX = anchorX / g_zoomScale + g_scrollX;
         float contentAnchorY = anchorY / g_zoomScale + g_scrollY;
 
@@ -186,8 +173,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_scrollY = contentAnchorY - anchorY / g_zoomScale;
 
         RecalcMaxScroll(hwnd);
-        // ズーム後に範囲外へはみ出していたらクランプ(ラバーバンドではなく即クランプでよい:
-        // ズーム操作中に境界を大きく超えることは稀なため、シンプルさを優先)
         g_scrollX = max(0.0f, min(g_maxScrollX, g_scrollX));
         g_scrollY = max(0.0f, min(g_maxScrollY, g_scrollY));
 
@@ -197,6 +182,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_TIMER: {
         if (wParam == SPRING_TIMER_ID) {
+            bool overNow = (g_scrollX < 0.0f || g_scrollX > g_maxScrollX ||
+                            g_scrollY < 0.0f || g_scrollY > g_maxScrollY);
+
+            if (overNow && !ss_is_touching(g_ss)) {
+                float evx = 0.0f, evy = 0.0f;
+                ss_get_velocity(g_ss, &evx, &evy);
+                ss_cancel_momentum(g_ss);
+                g_springVelX = evx / g_zoomScale;
+                g_springVelY = evy / g_zoomScale;
+            }
+
             if (!ss_is_scrolling(g_ss)) {
                 bool moved = false;
                 const float dt = SPRING_TIMER_MS / 1000.0f;
@@ -233,7 +229,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_ERASEBKGND:
-        return 1; // ダブルバッファ側で全面を塗るので何もしない（チカチカ防止）
+        return 1;
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -242,9 +238,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int w = rc.right - rc.left, h = rc.bottom - rc.top;
 
         EnsureBackBuffer(hdc, w, h);
-        HDC mdc = g_memDC ? g_memDC : hdc; // 万一バッファ作成に失敗したら直接描画にフォールバック
+        HDC mdc = g_memDC ? g_memDC : hdc;
 
-        // 背景
         HBRUSH bg = CreateSolidBrush(RGB(246, 247, 250));
         FillRect(mdc, &rc, bg);
         DeleteObject(bg);
@@ -254,14 +249,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         for (int r = 0; r < GRID_ROWS; r++) {
             float contentY = (float)(TOP_PAD + r * (CARD_H + GAP));
-            int y = (int)ContentToScreenY(contentY);
-            int cardH = (int)(CARD_H * g_zoomScale);
+            int y = RoundPx(ContentToScreenY(contentY));
+            int cardH = RoundPx(CARD_H * g_zoomScale);
             if (y + cardH < 0 || y > h) continue;
 
             for (int c = 0; c < GRID_COLS; c++) {
                 float contentX = (float)(MARGIN + c * (CARD_W + GAP));
-                int x = (int)ContentToScreenX(contentX);
-                int cardW = (int)(CARD_W * g_zoomScale);
+                int x = RoundPx(ContentToScreenX(contentX));
+                int cardW = RoundPx(CARD_W * g_zoomScale);
                 if (x + cardW < 0 || x > w) continue;
 
                 RECT card = { x, y, x + cardW, y + cardH };
@@ -271,7 +266,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HPEN cardPen = CreatePen(PS_SOLID, 1, RGB(210, 216, 228));
                 HGDIOBJ oldBrush = SelectObject(mdc, cardBrush);
                 HGDIOBJ oldPen = SelectObject(mdc, cardPen);
-                int radius = max(2, (int)(14 * g_zoomScale));
+                int radius = max(2, RoundPx(14 * g_zoomScale));
                 RoundRect(mdc, card.left, card.top, card.right, card.bottom, radius, radius);
                 SelectObject(mdc, oldBrush);
                 SelectObject(mdc, oldPen);
@@ -280,8 +275,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 wchar_t label[32];
                 swprintf_s(label, L"R%02d C%d", r + 1, c + 1);
-                RECT text = { card.left + (int)(20 * g_zoomScale), card.top,
-                              card.right - (int)(20 * g_zoomScale), card.bottom };
+                RECT text = { card.left + RoundPx(20 * g_zoomScale), card.top,
+                              card.right - RoundPx(20 * g_zoomScale), card.bottom };
                 SetTextColor(mdc, RGB(60, 66, 82));
                 DrawTextW(mdc, label, -1, &text, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
             }
@@ -289,7 +284,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         SelectObject(mdc, oldFont);
 
-        // 右端: 縦スクロールインジケータ
         {
             int trackX = w - 10;
             RECT track = { trackX, 8, trackX + 4, h - 8 };
@@ -304,13 +298,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ratio = max(0.0f, min(1.0f, ratio));
             float thumbY = track.top + (trackH - thumbH) * ratio;
 
-            RECT thumb = { trackX, (int)thumbY, trackX + 4, (int)(thumbY + thumbH) };
+            RECT thumb = { trackX, RoundPx(thumbY), trackX + 4, RoundPx(thumbY + thumbH) };
             HBRUSH thumbBrush = CreateSolidBrush(g_overscrollY ? RGB(230, 120, 90) : RGB(120, 140, 220));
             FillRect(mdc, &thumb, thumbBrush);
             DeleteObject(thumbBrush);
         }
 
-        // 下端: 横スクロールインジケータ
         {
             int trackY = h - 10;
             RECT track = { 8, trackY, w - 8, trackY + 4 };
@@ -325,13 +318,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ratio = max(0.0f, min(1.0f, ratio));
             float thumbX = track.left + (trackW - thumbW) * ratio;
 
-            RECT thumb = { (int)thumbX, trackY, (int)(thumbX + thumbW), trackY + 4 };
+            RECT thumb = { RoundPx(thumbX), trackY, RoundPx(thumbX + thumbW), trackY + 4 };
             HBRUSH thumbBrush = CreateSolidBrush(g_overscrollX ? RGB(230, 120, 90) : RGB(120, 140, 220));
             FillRect(mdc, &thumb, thumbBrush);
             DeleteObject(thumbBrush);
         }
 
-        // 左上: ズーム倍率表示(確認用)
         {
             wchar_t zoomLabel[32];
             swprintf_s(zoomLabel, L"Zoom: %.0f%%", g_zoomScale * 100.0f);
@@ -361,7 +353,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
-    // Precision Touchpad のパン操作を WM_POINTERWHEEL/HWHEEL として受け取るために必須。
     EnableMouseInPointer(TRUE);
 
     WNDCLASSW wc{};
@@ -369,7 +360,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int show) {
     wc.hInstance = hInst;
     wc.lpszClassName = L"SSDemo";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = nullptr; // WM_ERASEBKGND側で制御（ダブルバッファなので実際は使われない）
+    wc.hbrBackground = nullptr;
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"SmoothScroll Demo (Diagonal + Overscroll + Zoom)",

@@ -25,6 +25,19 @@ void PhysicsEngine::feedDelta(float dx, float dy, float dt_sec, bool update_x, b
         }
 
         float a = cfg_.velocity_ema;
+
+        // 逆に dt が異常に広い場合(指を離す直前、PTPのサンプリングが
+        // 疎になる場面で発生しやすい)は、この1サンプルだけで速度推定を
+        // 大きく動かしてしまわないよう、重みを dt に反比例させて弱める。
+        // (このサンプルの移動量自体は下の feedDelta 呼び出し元で
+        //  pending_dx/dy に加算され表示には反映されるので、見た目の
+        //  動きが消えるわけではなく、あくまで「速度推定への寄与」だけを
+        //  抑える)
+        if (dt_sec > kReleaseArtifactDt) {
+            float widen = kReleaseArtifactDt / dt_sec; // 0..1、広いほど小さくなる
+            a *= widen;
+        }
+
         // 更新対象の軸はEMAで平滑化して反映する。
         // 更新対象でない軸は「完全に凍結」ではなく、慣性と同じ指数減衰で
         // 緩やかにフェードさせる。完全凍結だと、軸ロックが長く続いた後に
@@ -92,6 +105,8 @@ bool PhysicsEngine::stepContinuous(float dt_sec, float& out_dx, float& out_dy) {
 
     // step()と全く同じ減衰計算だが、整数丸め・端数繰り越しを行わない。
     // ズームのスケール値(対数空間)のような、量子化してはいけない値のための経路。
+    // (パン用途でも、ホスト側がfloatの位置を保持できるなら量子化ジッター
+    //  回避のためにこちらを使ってよい。SS_Config::pan_subpixel 参照)
     float decay = std::exp(-cfg_.decay_rate * dt_sec);
 
     out_dx = vx_ * dt_sec;
@@ -121,6 +136,16 @@ void PhysicsEngine::stopMomentumOnly() {
     rem_x_ = rem_y_ = 0;
     momentum_ = false;
     // touching_ はそのまま維持する（呼び出し元がまだ操作中の可能性があるため）
+}
+
+void PhysicsEngine::scaleVelocity(float sx, float sy) {
+    vx_ *= sx;
+    vy_ *= sy;
+}
+
+void PhysicsEngine::getVelocity(float& vx, float& vy) const {
+    vx = vx_;
+    vy = vy_;
 }
 
 bool PhysicsEngine::isActive() const { return touching_ || momentum_; }

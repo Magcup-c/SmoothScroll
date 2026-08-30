@@ -15,8 +15,15 @@
 namespace {
 
 constexpr UINT_PTR SUBCLASS_ID      = 0x53534D4B; // 'SSMK'
-constexpr UINT_PTR PAN_TIMER_ID     = 1; // パン用: 90ms無入力でリリース判定
-constexpr UINT_PTR ZOOM_TIMER_ID    = 2; // ズーム用: 同様に90ms無入力でリリース判定
+
+// 重要: これらのタイマーIDは ss_attach 先の HWND に対して SetTimer/KillTimer される。
+// ホストアプリが同じ HWND に対して独自の SetTimer(hwnd, 1, ...) のような
+// 小さい/衝突しやすいIDを使っていた場合、SubclassProc がホストより先に
+// WM_TIMER を横取りして必ず return 0 してしまうため、ホスト側のタイマーハンドラに
+// メッセージが一切届かなくなるという実害のあるバグを踏む(実際に踏んだ)。
+// そのため、一般的なアプリが使うことがまずないユニークな値にしてある。
+constexpr UINT_PTR PAN_TIMER_ID     = 0x53534D01; // パン用: 90ms無入力でリリース判定
+constexpr UINT_PTR ZOOM_TIMER_ID    = 0x53534D02; // ズーム用: 同様に90ms無入力でリリース判定
 constexpr UINT     WM_SS_WAKE       = WM_APP + 0x53; // 物理ループ起床用
 
 // Precision Touchpad は HID Digitizer コレクション
@@ -121,11 +128,15 @@ DWORD WINAPI PhysicsThread(LPVOID param) {
             inst->cb(tdx, tdy, inst->user);
 
         // ---- パン: 慣性フェーズ ----
+        // pan_subpixel が有効なら整数丸めをしない stepContinuous() を使い、
+        // 慣性終盤の量子化ジッター(「ピタッ…ピタッ」という1px刻みの飛び)を回避する。
         float mdx = 0, mdy = 0;
         bool panActive;
         {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            panActive = inst->engine.step(frame_dt, mdx, mdy);
+            panActive = inst->cfg.pan_subpixel
+                ? inst->engine.stepContinuous(frame_dt, mdx, mdy)
+                : inst->engine.step(frame_dt, mdx, mdy);
         }
         if (mdx != 0 || mdy != 0)
             inst->cb(mdx, mdy, inst->user);
@@ -241,6 +252,10 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
 
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float px = (float)delta / (float)WHEEL_DELTA * inst->cfg.pixel_per_wheel;
+
+        // ホスト側の希望に応じて符号を反転する(「ナチュラルスクロール」方向の切り替え)。
+        if (msg == WM_POINTERWHEEL && inst->cfg.invert_vertical) px = -px;
+        if (msg == WM_POINTERHWHEEL && inst->cfg.invert_horizontal) px = -px;
 
         LARGE_INTEGER now_qpc;
         QueryPerformanceCounter(&now_qpc);
@@ -368,6 +383,11 @@ SS_API void ss_default_config(SS_Config* cfg) {
     cfg->enable_horizontal = TRUE;
     cfg->pass_through_wheel = TRUE;
 
+    cfg->pan_subpixel      = FALSE;
+
+    cfg->invert_vertical   = FALSE;
+    cfg->invert_horizontal = FALSE;
+
     cfg->enable_zoom        = FALSE;
     cfg->zoom_step          = 0.10f;
     cfg->zoom_decay_rate    = 4.0f;
@@ -429,17 +449,24 @@ SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, floa
     if (coeff <= 0.0f) coeff = 0.55f;
 
     float overshoot = 0.0f;
-    if (pos < min_pos) overshoot = min_pos - pos;
-    else if (pos > max_pos) overshoot = pos - max_pos;
+    bool low = false;
+    if (pos < min_pos) { overshoot = min_pos - pos; low = true; }
+    else if (pos > max_pos) { overshoot = pos - max_pos; }
 
     if (overshoot > 0.0f) {
+        // 既にオーバースクロール中: 押し込む方向のみ抵抗する非対称な挙動にする。
+        // 「戻ろうとする」方向(境界内へ近づく方向)は抵抗せずそのまま通す。
+        bool movingBack = low ? (raw_delta > 0.0f) : (raw_delta < 0.0f);
+        if (movingBack) {
+            return raw_delta;
+        }
         float resistance = coeff / (coeff + overshoot);
         return raw_delta * resistance;
     }
 
     float new_pos = pos + raw_delta;
     if (new_pos < min_pos) {
-        float within = min_pos - pos;
+        float within = pos - min_pos;
         float beyond = min_pos - new_pos;
         float resisted = coeff * beyond / (coeff + beyond);
         return -within - resisted;
@@ -500,6 +527,13 @@ SS_API BOOL ss_is_scrolling(HANDLE h) {
     return inst->engine.isActive() ? TRUE : FALSE;
 }
 
+SS_API BOOL ss_is_touching(HANDLE h) {
+    Instance* inst = static_cast<Instance*>(h);
+    if (!inst) return FALSE;
+    std::lock_guard<std::mutex> lk(inst->mtx);
+    return inst->engine.isTouching() ? TRUE : FALSE;
+}
+
 SS_API void ss_cancel_momentum(HANDLE h) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return;
@@ -512,4 +546,29 @@ SS_API void ss_stop_inertia(HANDLE h) {
     if (!inst) return;
     std::lock_guard<std::mutex> lk(inst->mtx);
     inst->engine.stopMomentumOnly();
+}
+
+SS_API void ss_scale_velocity(HANDLE h, float sx, float sy) {
+    Instance* inst = static_cast<Instance*>(h);
+    if (!inst) return;
+    std::lock_guard<std::mutex> lk(inst->mtx);
+    inst->engine.scaleVelocity(sx, sy);
+}
+
+SS_API void ss_get_velocity(HANDLE h, float* vx, float* vy) {
+    Instance* inst = static_cast<Instance*>(h);
+    if (!inst) return;
+    std::lock_guard<std::mutex> lk(inst->mtx);
+    float x = 0, y = 0;
+    inst->engine.getVelocity(x, y);
+    if (vx) *vx = x;
+    if (vy) *vy = y;
+}
+
+SS_API void ss_set_invert(HANDLE h, BOOL invert_vertical, BOOL invert_horizontal) {
+    Instance* inst = static_cast<Instance*>(h);
+    if (!inst) return;
+    std::lock_guard<std::mutex> lk(inst->mtx);
+    inst->cfg.invert_vertical = invert_vertical;
+    inst->cfg.invert_horizontal = invert_horizontal;
 }

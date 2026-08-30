@@ -54,6 +54,37 @@ SS_Config MakeZoomPhysicsConfig(const SS_Config& c) {
     return zc;
 }
 
+// ============================================================
+// ラバーバンド圧縮曲線 f(o) = coeff*o / (coeff+o)
+// 「真の(未圧縮)オーバースクロール量 o」を「見た目上の圧縮された変位」に
+// マッピングする単調増加関数(値域は [0, coeff) に漸近)。
+// RubberbandExpand() はその逆関数で、現在の見た目上の変位から
+// 真のオーバースクロール量を復元する。
+//
+// 以前の実装は「既にオーバースクロール中」と「今フレームで境界を超えた」で
+// 別々の式を使っており、overshoot が 0 をまたぐ瞬間に抵抗のかかり方が
+// 不連続にジャンプしていた(境界ちょうどでは強く抵抗するのに、その1フレーム後
+// にはほぼ無抵抗になる、など)。さらに「戻る方向は常に無抵抗で素通し」という
+// 特殊扱いもあり、押す/戻すの切り替え時に速度が不連続に変化していた。
+// これらが「端でカクつく/ジャンプする」という体感の原因だった。
+//
+// 修正版は常にこの1本の曲線だけを使い、押し込み/戻し/境界またぎの
+// すべてのケースを「仮想オーバースクロール量に delta を加算してから
+// 再度圧縮する」という同一の式で扱うことで連続性を保証する。
+// ============================================================
+inline float RubberbandCompress(float o, float coeff) {
+    if (o <= 0.0f) return 0.0f;
+    return coeff * o / (coeff + o);
+}
+
+inline float RubberbandExpand(float d, float coeff) {
+    if (d <= 0.0f) return 0.0f;
+    // f の値域は [0, coeff) なので、数値誤差で d >= coeff になった場合の
+    // ゼロ除算/負値化を防ぐ安全策。
+    if (d >= coeff) d = coeff * 0.999999f;
+    return coeff * d / (coeff - d);
+}
+
 struct Instance {
     HWND hwnd = nullptr;
     SS_Config cfg{};
@@ -197,17 +228,6 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     case WM_POINTERHWHEEL: {
         if (!IsTouchpadActive(inst)) break;
 
-        // 重要: EnableMouseInPointer(TRUE)が有効な環境では、ピンチズームの
-        // 「Ctrl+ホイール」互換シグナルも classic WM_MOUSEWHEEL ではなく、
-        // この WM_POINTERWHEEL として届く。
-        // ただし wParam に埋め込まれたキー修飾フラグ(MK_CONTROL)には
-        // 実機検証の結果、決して乗らない(常にno)ことが確認されている。
-        // GetKeyState(VK_CONTROL) も、キーを物理的に押しっぱなしにしても
-        // 数回で検出が途切れることがあり信頼できなかった。
-        // 最終的に GetAsyncKeyState(VK_CONTROL) で毎回直接OSに問い合わせる
-        // 方式が最も安定していることが実機検証(複数回・数百イベント規模)で
-        // 確認された。純粋なパン動作ではほぼ反応せず、実際のピンチ動作でのみ
-        // 高頻度でtrueになる。
         {
             bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             if (ctrlDown && inst->cfg.enable_zoom && inst->cb_zoom) {
@@ -253,7 +273,6 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float px = (float)delta / (float)WHEEL_DELTA * inst->cfg.pixel_per_wheel;
 
-        // ホスト側の希望に応じて符号を反転する(「ナチュラルスクロール」方向の切り替え)。
         if (msg == WM_POINTERWHEEL && inst->cfg.invert_vertical) px = -px;
         if (msg == WM_POINTERHWHEEL && inst->cfg.invert_horizontal) px = -px;
 
@@ -291,13 +310,11 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
         return 0;
     }
 
-    // classic マウスホイール経由のCtrl+ホイール(EnableMouseInPointerを
-    // 使わない環境向けのフォールバック経路)。
     case WM_MOUSEWHEEL: {
         if (!inst->cfg.enable_zoom || !inst->cb_zoom) break;
 
         bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (!ctrlDown) break; // 通常ホイールは素通し
+        if (!ctrlDown) break;
 
         short delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float logStep = (float)delta / (float)WHEEL_DELTA * inst->cfg.zoom_step;
@@ -359,7 +376,7 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     case WM_POINTERDOWN:
         if (IsTouchpadActive(inst)) {
             std::lock_guard<std::mutex> lk(inst->mtx);
-            inst->engine.cancel(); // 新しいタッチで慣性をキャンセル（本当の新規セッション）
+            inst->engine.cancel();
         }
         break;
 
@@ -448,36 +465,43 @@ SS_API HANDLE ss_attach(HWND hwnd, const SS_Config* cfg, SS_ScrollCallback cb, S
 SS_API float ss_rubberband_delta(float raw_delta, float pos, float min_pos, float max_pos, float coeff) {
     if (coeff <= 0.0f) coeff = 0.55f;
 
-    float overshoot = 0.0f;
-    bool low = false;
-    if (pos < min_pos) { overshoot = min_pos - pos; low = true; }
-    else if (pos > max_pos) { overshoot = pos - max_pos; }
+    bool high;
+    float excess;
+    float delta;
 
-    if (overshoot > 0.0f) {
-        // 既にオーバースクロール中: 押し込む方向のみ抵抗する非対称な挙動にする。
-        // 「戻ろうとする」方向(境界内へ近づく方向)は抵抗せずそのまま通す。
-        bool movingBack = low ? (raw_delta > 0.0f) : (raw_delta < 0.0f);
-        if (movingBack) {
-            return raw_delta;
+    if (pos > max_pos) {
+        high = true;
+        excess = pos - max_pos;
+        delta = raw_delta;
+    } else if (pos < min_pos) {
+        high = false;
+        excess = min_pos - pos;
+        delta = -raw_delta;
+    } else {
+        float new_pos = pos + raw_delta;
+        if (new_pos > max_pos) {
+            float beyond = new_pos - max_pos;
+            float resisted = RubberbandCompress(beyond, coeff);
+            return (max_pos - pos) + resisted;
         }
-        float resistance = coeff / (coeff + overshoot);
-        return raw_delta * resistance;
+        if (new_pos < min_pos) {
+            float beyond = min_pos - new_pos;
+            float resisted = RubberbandCompress(beyond, coeff);
+            return (min_pos - pos) - resisted;
+        }
+        return raw_delta;
     }
 
-    float new_pos = pos + raw_delta;
-    if (new_pos < min_pos) {
-        float within = pos - min_pos;
-        float beyond = min_pos - new_pos;
-        float resisted = coeff * beyond / (coeff + beyond);
-        return -within - resisted;
+    float virtualExcess = RubberbandExpand(excess, coeff) + delta;
+
+    if (virtualExcess <= 0.0f) {
+        float total = -excess + virtualExcess;
+        return high ? total : -total;
     }
-    if (new_pos > max_pos) {
-        float within = max_pos - pos;
-        float beyond = new_pos - max_pos;
-        float resisted = coeff * beyond / (coeff + beyond);
-        return within + resisted;
-    }
-    return raw_delta;
+
+    float newExcess = RubberbandCompress(virtualExcess, coeff);
+    float appliedInPushDir = newExcess - excess;
+    return high ? appliedInPushDir : -appliedInPushDir;
 }
 
 SS_API float ss_spring_step(float pos, float target, float* velocity, float dt_sec,

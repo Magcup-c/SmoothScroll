@@ -15,7 +15,6 @@
 #include "../SmoothScroll/SmoothScroll.h"
 
 namespace {
-    // ---- グリッドレイアウト（縦横スクロールを見せるため2次元に配置） ----
     constexpr int GRID_COLS   = 3;
     constexpr int GRID_ROWS   = 20;
     constexpr int CARD_W      = 260;
@@ -36,6 +35,16 @@ namespace {
 
     HANDLE g_ss = nullptr;
     float g_springVelX = 0.0f, g_springVelY = 0.0f;
+
+    // 慣性→バネの速度引き継ぎ(ハンドオフ)を「オーバースクロール1回の区間につき
+    // 一度だけ」行うためのフラグ。
+    // これが無いと、overNow(オーバースクロール中) && !ss_is_touching(指離れ)が
+    // trueである間、WM_TIMERが呼ばれるたびに毎回 ss_get_velocity()で速度を
+    // 取得し直してしまう。しかし最初のハンドオフで ss_cancel_momentum() 済みの
+    // ため、2回目以降に取得できる速度は常に0。その0でg_springVelX/Yを
+    // 毎フレーム上書きしてしまい、バネが「16ms分だけ加速→即0にリセット」を
+    // 延々繰り返す羽目になり、これが端での「カクつき/ジャンプ」の主因だった。
+    bool g_springHandoffDone = false;
 
     constexpr UINT_PTR SPRING_TIMER_ID = 1;
     constexpr UINT     SPRING_TIMER_MS = 16;
@@ -186,11 +195,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             g_scrollY < 0.0f || g_scrollY > g_maxScrollY);
 
             if (overNow && !ss_is_touching(g_ss)) {
-                float evx = 0.0f, evy = 0.0f;
-                ss_get_velocity(g_ss, &evx, &evy);
-                ss_cancel_momentum(g_ss);
-                g_springVelX = evx / g_zoomScale;
-                g_springVelY = evy / g_zoomScale;
+                if (!g_springHandoffDone) {
+                    float evx = 0.0f, evy = 0.0f;
+                    ss_get_velocity(g_ss, &evx, &evy);
+                    ss_cancel_momentum(g_ss);
+                    g_springVelX = evx / g_zoomScale;
+                    g_springVelY = evy / g_zoomScale;
+                    g_springHandoffDone = true;
+                }
+            } else {
+                g_springHandoffDone = false;
             }
 
             if (!ss_is_scrolling(g_ss)) {

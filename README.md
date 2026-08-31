@@ -1,59 +1,99 @@
-# SmoothScrollLib — Mac風スムース/慣性スクロール DLL（Windows タッチパッド用）
+# SmoothScroll
 
-アプリのウィンドウに組み込むだけで、Precision Touchpad の2本指スクロールを
-Mac風の滑らかな慣性スクロールに変換するC++ライブラリです。
+Windows (10以降) / Precision Touchpad 向けの Mac風スムーススクロール・
+慣性スクロール DLL。パン(スクロール)・ピンチズーム・オーバースクロール
+(ラバーバンド + バネ)を提供します。
 
-## 仕組み
+- 指を離した後の慣性(指数減衰)スクロール
+- Ctrl+ホイール(ピンチ互換シグナル)によるカーソル中心のスムーズなズーム
+- 境界でのラバーバンド抵抗 + バネで押し戻すオーバースクロール演出
+- タッチ中の入力は待ち時間なくそのまま反映(物理ループスレッドを経由しない)
 
-1. `ss_attach(hwnd, ...)` でウィンドウを `SetWindowSubclass` によりサブクラス化
-2. タッチパッド由来の `WM_POINTERWHEEL / WM_POINTERHWHEEL` を捕捉（`PT_TOUCHPAD` で判定）
-3. 生デルタを飲み込み、内部物理エンジンへ入力
-   - タッチ中: 生デルタをフレーム単位でそのまま出力しつつ、速度をEMA推定
-   - リリース後: 推定速度を初速に `v *= exp(-k·dt)` の指数減衰で慣性スクロール
-   - 低速（`stop_velocity` 未満）で「ぴたっと」停止。サブピクセル端数は繰り越し
-4. 物理ループは専用スレッド＋高分解能ウェイタブルタイマで実リフレッシュレートに同期。
-   アイドル時はイベント待機でCPUを消費しません
-5. スムーズ化されたピクセルデルタをコールバックで返す
+## 構成
+
+```
+SmoothScroll/
+  SmoothScroll.h          … 公開C API
+  SmoothScroll.cpp         … DLL本体(サブクラス化 + 物理ループスレッド)
+  SmoothScrollHelper.h      … C++向け薄いラッパー(スレッド安全なコールバック配送、推奨)
+  PhysicsEngine.h / .cpp   … 慣性の物理モデル
+demo/
+  main.cpp                 … 利用例(グリッドスクロール + オーバースクロール + ズーム)
+CMakeLists.txt
+```
 
 ## ビルド
 
-```bat
-cmake -B build -A x64
-cmake --build build --config Release
 ```
-`build/Release/SmoothScroll.dll` / `.lib` と `SSDemo.exe` が生成されます。
-Visual Studio 2022 で `.sln` を開きたい場合は `cmake -B build -G "Visual Studio 17 2022" -A x64`。
+cmake -B build
+cmake --build build
+```
 
-## 使い方（3行）
+`SmoothScroll.dll`(共有ライブラリ)と、動作確認用の`SSDemo.exe`が生成されます。
+`SSDemo`を実行すると、斜めスクロール・端でのラバーバンド/バネ・Ctrl+ホイールでの
+ズームを試せます。
+
+## クイックスタート
+
+C++で組み込む場合は、生のC APIを直接叩くのではなく `SmoothScrollHelper` の
+利用を推奨します(コールバックの呼び出し元スレッドの違いを自動で吸収します)。
 
 ```cpp
-SS_Config cfg; ss_default_config(&cfg);
-HANDLE h = ss_attach(hwnd, &cfg, OnScroll, myData);
-// ...終了時に ss_detach(h);
+#include "SmoothScrollHelper.h"
+
+SmoothScrollHelper g_ssHelper;
+
+case WM_CREATE: {
+    SS_Config cfg; ss_default_config(&cfg);
+    cfg.enable_zoom = TRUE;
+    g_ssHelper.Attach(hwnd, &cfg,
+        [](float dx, float dy) {
+            // 常にUIスレッド上で呼ばれる。直接UI更新してよい。
+            g_scrollX += dx; g_scrollY += dy;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        },
+        [](float scale, float ax, float ay) {
+            // ズームコールバック(不要なら省略可)
+        });
+    return 0;
+}
+
+case SmoothScrollHelper::kScrollMessage:
+case SmoothScrollHelper::kZoomMessage:
+    g_ssHelper.HandleMessage(msg, wParam, lParam);
+    return 0;
+
+case WM_DESTROY:
+    g_ssHelper.Detach();
+    ...
 ```
 
-コールバックで受け取る `dx, dy` は「このフレームでスクロールすべきピクセル量」です。
-コールバックは物理スレッドから呼ばれるので、UI更新は `PostMessage` でUIスレッドへ
-回してください（demo/main.cpp 参照）。
+境界でのラバーバンド抵抗やバネによる押し戻しはホスト側の責務です。
+`ss_rubberband_delta()` / `ss_spring_step()` / `ss_spring_settled()` という
+状態を持たない純粋関数が提供されているので、これらを使って自前のスクロール
+位置に適用してください(具体的な組み込み例は `demo/main.cpp` および
+下記の仕様書を参照)。
 
-## チューニング（SS_Config）
+## ドキュメント
 
-| パラメータ | 既定 | 意味 |
-|---|---|---|
-| `decay_rate` | 4.0 | 慣性の減衰率。小さいほど「よく滑る」。Mac風は3〜5 |
-| `velocity_ema` | 0.35 | 指速度推定の平滑化。小さいほど滑らかだが反応は鈍くなる |
-| `stop_velocity` | 25.0 | この速度[px/s]未満で即停止 |
-| `max_velocity` | 6000 | フリック初速の上限 |
-| `pixel_per_wheel` | 100 | ホイールデルタ120あたりの換算ピクセル |
-| `enable_horizontal` | TRUE | 横方向も処理するか |
+| ドキュメント | 内容 |
+|---|---|
+| [`SmoothScroll_Spec.md`](./SmoothScroll_Spec.md) | 全APIリファレンス、`SS_Config`全項目、`SmoothScrollHelper`の使い方、実装上の落とし穴集 |
+| [`DEBUG_NOTES.md`](./DEBUG_NOTES.md) | 過去のデバッグ記録(端のカクつき/ジャンプ、軸ロック時の突っかかり、タッチ中の遅延、それぞれの原因と修正) |
 
-## 注意事項
+初めて触る場合はこのREADMEでビルド・動作確認まで行い、実際に組み込む際は
+`SmoothScroll_Spec.md`を参照するのがおすすめです。過去に踏んだ実装上の
+落とし穴(タイマーID衝突、軸ロック時の速度凍結、ラバーバンドの連続性など)は
+すべて仕様書の最終章にまとめてあります。
 
-- 対象は **Precision Touchpad（2本指パン → WM_POINTERWHEEL/HWHEEL）** です。
-  通常のUSBマウスのホイールは素通しされます（アプリ既定の挙動が維持されます）
-- ジェスチャ終了はOSから明示通知されないため、90ms無入力でリリースと判定しています
-- 直接タッチ（タッチスクリーンやタッチパッド接触イベント）を使いたい場合は
-  `RegisterPointerInputTarget(hwnd, PT_TOUCHPAD)` の追加が必要です
-- アプリ内の1ウィンドウ専用です。OS全体に効かせる場合はグローバルフック型の
-  別アーキテクチャが必要になります
-# SmoothScroll
+## 動作要件
+
+- Windows 10以降
+- Precision Touchpad (WM_POINTERWHEEL/WM_POINTERHWHEEL に対応したドライバ)
+- MSVC (CMakeLists.txt は `/utf-8` オプションを前提にしています)
+
+## 既知の制約
+
+- Windows設定の「2本指ドラッグでスクロール」がOFFの場合、そもそもOS側が
+  ジェスチャーをスクロールイベントとして合成しないため、本ライブラリは
+  何もできません(他の一般的なアプリと同様の制約です)。
